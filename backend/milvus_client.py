@@ -25,6 +25,19 @@ class MilvusManager:
             self.client = MilvusClient(uri=self.uri)
         return self.client
 
+    def _ensure_connection(self) -> MilvusClient:
+        """确保连接有效，如果连接失效则重新创建"""
+        try:
+            # 尝试一个简单的操作来测试连接是否有效
+            client = self._get_client()
+            # 检查集合是否存在是一个轻量级操作，用于验证连接
+            client.has_collection(self.collection_name)
+            return client
+        except Exception:
+            # 连接失效，重新创建
+            self.client = MilvusClient(uri=self.uri)
+            return self.client
+
     def init_collection(self, dense_dim: int | None = None):
         """
         初始化 Milvus 集合 - 同时支持密集向量和稀疏向量
@@ -32,7 +45,7 @@ class MilvusManager:
         """
         if dense_dim is None:
             dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
-        client = self._get_client()
+        client = self._ensure_connection()
         if not client.has_collection(self.collection_name):
             schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
             
@@ -86,7 +99,7 @@ class MilvusManager:
 
     def insert(self, data: list[dict]):
         """插入数据到 Milvus"""
-        return self._get_client().insert(self.collection_name, data)
+        return self._ensure_connection().insert(self.collection_name, data)
 
     def query(
         self,
@@ -96,7 +109,7 @@ class MilvusManager:
         offset: int = 0,
     ):
         """查询数据。limit 不宜超过 QUERY_MAX_LIMIT。"""
-        return self._get_client().query(
+        return self._ensure_connection().query(
             collection_name=self.collection_name,
             filter=filter_expr,
             output_fields=output_fields or ["filename", "file_type"],
@@ -110,7 +123,7 @@ class MilvusManager:
         out: list = []
         offset = 0
         while True:
-            batch = self._get_client().query(
+            batch = self._ensure_connection().query(
                 collection_name=self.collection_name,
                 filter=filter_expr,
                 output_fields=fields,
@@ -198,7 +211,7 @@ class MilvusManager:
         # 使用 RRF 排序算法融合结果
         reranker = RRFRanker(k=rrf_k)
         
-        results = self._get_client().hybrid_search(
+        results = self._ensure_connection().hybrid_search(
             collection_name=self.collection_name,
             reqs=[dense_search, sparse_search],
             ranker=reranker,
@@ -230,7 +243,7 @@ class MilvusManager:
         """
         仅使用密集向量检索（降级模式，用于稀疏向量不可用时）
         """
-        results = self._get_client().search(
+        results = self._ensure_connection().search(
             collection_name=self.collection_name,
             data=[dense_embedding],
             anns_field="dense_embedding",
@@ -271,17 +284,17 @@ class MilvusManager:
 
     def delete(self, filter_expr: str):
         """删除数据"""
-        return self._get_client().delete(
+        return self._ensure_connection().delete(
             collection_name=self.collection_name,
             filter=filter_expr
         )
 
     def has_collection(self) -> bool:
         """检查集合是否存在"""
-        return self._get_client().has_collection(self.collection_name)
+        return self._ensure_connection().has_collection(self.collection_name)
 
     def drop_collection(self):
         """删除集合（用于重建 schema）"""
-        client = self._get_client()
+        client = self._ensure_connection()
         if client.has_collection(self.collection_name):
             client.drop_collection(self.collection_name)

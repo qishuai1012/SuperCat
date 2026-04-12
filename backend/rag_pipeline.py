@@ -158,6 +158,7 @@ def retrieve_initial(state: RAGState) -> RAGState:
 def grade_documents_node(state: RAGState) -> RAGState:
     grader = _get_grader_model()
     emit_rag_step("📊", "正在评估文档相关性...")
+    print(f"DEBUG: Grader model: {GRADE_MODEL}, API key present: {bool(API_KEY)}")  # 调试信息
     if not grader:
         grade_update = {
             "grade_score": "unknown",
@@ -170,10 +171,40 @@ def grade_documents_node(state: RAGState) -> RAGState:
     question = state["question"]
     context = state.get("context", "")
     prompt = GRADE_PROMPT.format(question=question, context=context)
-    response = grader.with_structured_output(GradeDocuments).invoke(
-        [{"role": "user", "content": prompt}]
-    )
-    score = (response.binary_score or "").strip().lower()
+    #原始代码
+    # response = grader.with_structured_output(GradeDocuments).invoke([
+    #     {"role": "user", "content": prompt}
+    # ])
+    # score = (response.binary_score or "").strip().lower()
+    #修复----
+    try:
+        print(f"DEBUG: 尝试结构化输出调用")  # 调试信息
+        response = grader.with_structured_output(GradeDocuments).invoke(
+            [{"role": "user", "content": prompt}]
+        )
+        score = (response.binary_score or "").strip().lower()
+        print(f"DEBUG: 结构化输出成功，得分: {score}")  # 调试信息
+    except Exception as e:
+        print(f"DEBUG: 结构化输出失败: {e}")  # 调试信息
+        # 如果结构化输出失败，尝试普通调用并手动解析
+        try:
+            print(f"DEBUG: 尝试普通调用")  # 调试信息
+            raw_response = grader.invoke([{"role": "user", "content": prompt}])
+            content = str(raw_response.content if hasattr(raw_response, 'content') else raw_response)
+            print(f"DEBUG: 普通调用响应: {content}")  # 调试信息
+            # 简单地从文本中提取yes/no
+            content_lower = content.lower()
+            if "yes" in content_lower and "no" not in content_lower:
+                score = "yes"
+            elif "no" in content_lower:
+                score = "no"
+            else:
+                score = "no"  # 默认认为不相关
+            print(f"DEBUG: 解析得分: {score}")  # 调试信息
+        except Exception as e2:
+            print(f"DEBUG: 普通调用也失败: {e2}")  # 调试信息
+            score = "no"  # 如果都失败了，默认不相关
+
     route = "generate_answer" if score == "yes" else "rewrite_question"
     if route == "generate_answer":
         emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
