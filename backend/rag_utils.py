@@ -10,6 +10,9 @@ from embedding import embedding_service as _embedding_service
 from parent_chunk_store import ParentChunkStore
 from langchain.chat_models import init_chat_model
 
+# 这是 RAG 检索核心引擎
+# 作用：用户问问题 → 去向量库检索 → 重排 → 自动合并小文档 → 返回最相关资料
+
 load_dotenv()
 
 ARK_API_KEY = os.getenv("ARK_API_KEY")
@@ -28,28 +31,33 @@ _parent_chunk_store = ParentChunkStore()
 
 _stepback_model = None
 
-
+#获取重排序接口地址
 def _get_rerank_endpoint() -> str:
     if not RERANK_BINDING_HOST:
         return ""
     host = RERANK_BINDING_HOST.strip().rstrip("/")
     return host if host.endswith("/v1/rerank") else f"{host}/v1/rerank"
 
-
+#自动合并文档   小块数量 ≥ 阈值 → 自动替换成父块（更大、更完整）
 def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[dict], int]:
+    # 创建一个分组字典：key=父块ID，value=属于这个父块的所有小块
     groups: Dict[str, List[dict]] = defaultdict(list)
     for doc in docs:
         parent_id = (doc.get("parent_chunk_id") or "").strip()
         if parent_id:
             groups[parent_id].append(doc)
 
+    # 筛选出：需要合并的父块ID
     merge_parent_ids = [parent_id for parent_id, children in groups.items() if len(children) >= threshold]
     if not merge_parent_ids:
         return docs, 0
 
+    # 去父块存储里，批量查询这些父块的完整内容
     parent_docs = _parent_chunk_store.get_documents_by_ids(merge_parent_ids)
+    #parent_map 存储父块的id和内容
     parent_map = {item.get("chunk_id", ""): item for item in parent_docs if item.get("chunk_id")}
 
+    #最终合并好的块列表
     merged_docs: List[dict] = []
     merged_count = 0
     for doc in docs:
@@ -77,7 +85,7 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
 
     return deduped, merged_count
 
-
+#两层合并（L3→L2 → L2→L1）
 def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
     if not AUTO_MERGE_ENABLED or not docs:
         return docs[:top_k], {
@@ -104,7 +112,7 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
         "auto_merge_steps": int(merged_count_l3_l2 > 0) + int(merged_count_l2_l1 > 0),
     }
 
-
+ # 重排序（让最相关的排前面）
 def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
@@ -162,7 +170,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         meta["rerank_error"] = str(e)
         return docs_with_rank[:top_k], meta
 
-
+# 退步查询模型（StepBack）
 def _get_stepback_model():
     global _stepback_model
     if not ARK_API_KEY or not MODEL:
@@ -207,7 +215,7 @@ def _answer_step_back_question(step_back_question: str) -> str:
     except Exception:
         return ""
 
-
+#生成假设性文档（HyDE）
 def generate_hypothetical_document(query: str) -> str:
     model = _get_stepback_model()
     if not model:
@@ -223,7 +231,7 @@ def generate_hypothetical_document(query: str) -> str:
     except Exception:
         return ""
 
-
+# 扩展查询（StepBack + 原始问题）
 def step_back_expand(query: str) -> dict:
     step_back_question = _generate_step_back_question(query)
     step_back_answer = _answer_step_back_question(step_back_question)

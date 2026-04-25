@@ -17,6 +17,8 @@ API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
 
+# 对话存储类
+# 这是整个文件最核心的数据持久化模块负责：存对话、读对话、删会话、列会话、缓存加速
 class ConversationStorage:
     """对话存储（PostgreSQL + Redis）。"""
 
@@ -28,6 +30,7 @@ class ConversationStorage:
     def _sessions_cache_key(user_id: str) -> str:
         return f"chat_sessions:{user_id}"
 
+    # 把数据库里的 JSON 消息 → 转成 AI 能识别的消息对象
     @staticmethod
     def _to_langchain_messages(records: list[dict]) -> list:
         messages = []
@@ -44,12 +47,13 @@ class ConversationStorage:
 
     def save(self, user_id: str, session_id: str, messages: list, metadata: dict = None, extra_message_data: list = None):
         """保存对话"""
-        db = SessionLocal()
+        db = SessionLocal()         # 打开数据库连接
         try:
+            # 查找用户
             user = db.query(User).filter(User.username == user_id).first()
             if not user:
                 return
-
+            # 查找/创建会话
             session = (
                 db.query(ChatSession)
                 .filter(ChatSession.user_id == user.id, ChatSession.session_id == session_id)
@@ -61,7 +65,7 @@ class ConversationStorage:
                 db.flush()
             else:
                 session.metadata_json = metadata or {}
-
+            # 删除旧消息
             db.query(ChatMessage).filter(ChatMessage.session_ref_id == session.id).delete(synchronize_session=False)
 
             serialized = []
@@ -71,7 +75,7 @@ class ConversationStorage:
                 if extra_message_data and idx < len(extra_message_data):
                     extra = extra_message_data[idx] or {}
                     rag_trace = extra.get("rag_trace")
-
+                # 存入数据库
                 db.add(
                     ChatMessage(
                         session_ref_id=session.id,
@@ -81,6 +85,7 @@ class ConversationStorage:
                         rag_trace=rag_trace,
                     )
                 )
+                # 存入缓存格式
                 serialized.append(
                     {
                         "type": msg.type,
@@ -92,12 +97,13 @@ class ConversationStorage:
 
             session.updated_at = now
             db.commit()
-
+            # 更新缓存
             cache.set_json(self._messages_cache_key(user_id, session_id), serialized)
             cache.delete(self._sessions_cache_key(user_id))
         finally:
             db.close()
 
+    # 加载对话
     def load(self, user_id: str, session_id: str) -> list:
         """加载对话"""
         cached = cache.get_json(self._messages_cache_key(user_id, session_id))

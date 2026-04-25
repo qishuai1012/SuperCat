@@ -6,10 +6,17 @@ from cache import cache
 from database import SessionLocal
 from models import ParentChunk
 
+# ---------------------父块文档的存储工具-----------------
+# 作用：
+# 把大的父块文档存到 PostgreSQL
+# 同时缓存到 Redis
+# 提供：增、查、删 功能
+# 专门给 Auto-Merge 合并用
 
 class ParentChunkStore:
     """基于 PostgreSQL + Redis 的父级分块存储。"""
 
+    #工具方法：数据库对象 → 字典
     @staticmethod
     def _to_dict(item: ParentChunk) -> dict:
         return {
@@ -25,10 +32,23 @@ class ParentChunkStore:
             "chunk_idx": item.chunk_idx,
         }
 
+    #生成 Redis 缓存 key
     @staticmethod
     def _cache_key(chunk_id: str) -> str:
         return f"parent_chunk:{chunk_id}"
 
+    #写入 / 更新父块
+    # 功能：
+    # 接收一堆父块 → 存到数据库 + 存到 Redis
+    # 流程：
+    # 遍历每个块
+    # 按 chunk_id 查询是否已存在
+    # 存在 → 更新
+    # 不存在 → 新增
+    # 同时写入 Redis 缓存
+    # 返回成功写入条数
+    # 作用：
+    # 把解析好的大父块，存起来，等合并时用！
     def upsert_documents(self, docs: List[dict]) -> int:
         """写入/更新父级分块，返回写入条数。"""
         if not docs:
@@ -82,6 +102,14 @@ class ParentChunkStore:
 
         return upserted
 
+    #核心：批量按 ID 查父块（给合并用）
+    #功能：
+    # 给一堆父块 ID → 返回完整内容
+    # 流程：
+    # 先去 Redis 查（快）
+    # Redis 没有 → 去数据库查
+    # 查到后 → 塞进 Redis 缓存
+    # 按传入顺序返回结果
     def get_documents_by_ids(self, chunk_ids: List[str]) -> List[dict]:
         if not chunk_ids:
             return []
@@ -111,6 +139,15 @@ class ParentChunkStore:
 
         return [ordered_results[item] for item in chunk_ids if item in ordered_results]
 
+    # 按文件名删除
+    # 删除数据库中该文件的所有父块
+    # 同时删除
+    # Redis
+    # Redis
+    # 缓存
+    # 返回删除条数
+    # 作用：
+    # 删除文件时，父块一起删掉！
     def delete_by_filename(self, filename: str) -> int:
         """按文件名删除父级分块，返回删除条数。"""
         if not filename:

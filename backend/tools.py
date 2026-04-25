@@ -12,17 +12,17 @@ load_dotenv()
 AMAP_WEATHER_API = os.getenv("AMAP_WEATHER_API")
 AMAP_API_KEY = os.getenv("AMAP_API_KEY")
 
-_LAST_RAG_CONTEXT = None
-_KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
-_RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming
-_RAG_STEP_LOOP = None   # asyncio loop, captured when setting queue
+_LAST_RAG_CONTEXT = None            # 保存 RAG 检索结果
+_KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0     # 限制每轮只能查 1 次知识库
+_RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming  # 向前端推步骤
+_RAG_STEP_LOOP = None   # asyncio loop, captured when setting queue # 异步循环
 
-
+#将传进来的结果存进这个变量里面
 def _set_last_rag_context(context: dict):
     global _LAST_RAG_CONTEXT
     _LAST_RAG_CONTEXT = context
 
-
+#取最近一次 RAG 检索上下文，默认读取后清空
 def get_last_rag_context(clear: bool = True) -> Optional[dict]:
     """获取最近一次 RAG 检索上下文，默认读取后清空。"""
     global _LAST_RAG_CONTEXT
@@ -31,13 +31,13 @@ def get_last_rag_context(clear: bool = True) -> Optional[dict]:
         _LAST_RAG_CONTEXT = None
     return context
 
-
+#重置知识库调用计数
 def reset_tool_call_guards():
     """每轮对话开始时重置工具调用计数。"""
     global _KNOWLEDGE_TOOL_CALLS_THIS_TURN
     _KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
 
-
+#传入rag的步骤队列，捕捉异步调度
 def set_rag_step_queue(queue):
     """设置 RAG 步骤队列，并捕获当前事件循环以便跨线程调度。"""
     global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
@@ -51,19 +51,24 @@ def set_rag_step_queue(queue):
     else:
         _RAG_STEP_LOOP = None
 
-
+#把 RAG 的步骤（比如：正在检索、正在重排）安全地推送给前端！支持跨线程
 def emit_rag_step(icon: str, label: str, detail: str = ""):
     """向队列发送一个 RAG 检索步骤。支持跨线程安全调用。"""
     global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
     if _RAG_STEP_QUEUE is not None and _RAG_STEP_LOOP is not None:
         step = {"icon": icon, "label": label, "detail": detail}
         try:
-            if not _RAG_STEP_LOOP.is_closed():
+            if not _RAG_STEP_LOOP.is_closed():      #判断：异步事件循环有没有被关闭
+                # call_soon_threadsafe：把动作丢进【线程安全队列】，保证线程安全
                 _RAG_STEP_LOOP.call_soon_threadsafe(_RAG_STEP_QUEUE.put_nowait, step)
         except Exception:
             pass
 
-
+#调用高德地图的天气 API，返回格式化的天气文本
+# 定义函数：获取天气
+# 参数：
+# location：城市（如北京、上海）
+# extensions：base = 实时天气，all = 预报
 def get_current_weather(location: str, extensions: Optional[str] = "base") -> str:
     """获取天气信息"""
     if not location:
@@ -73,7 +78,7 @@ def get_current_weather(location: str, extensions: Optional[str] = "base") -> st
 
     if not AMAP_WEATHER_API or not AMAP_API_KEY:
         return "天气服务未配置（缺少 AMAP_WEATHER_API 或 AMAP_API_KEY）"
-
+    #构造请求高德 API 的参数
     params = {
         "key": AMAP_API_KEY,
         "city": location,
@@ -82,7 +87,9 @@ def get_current_weather(location: str, extensions: Optional[str] = "base") -> st
     }
 
     try:
+        #发送 HTTP 请求拿天气
         resp = requests.get(AMAP_WEATHER_API, params=params, timeout=10)
+        #转成 JSON 字典
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != "1":
@@ -151,9 +158,10 @@ def search_knowledge_base(query: str) -> str:
 
     docs = rag_result.get("docs", []) if isinstance(rag_result, dict) else []
     rag_trace = rag_result.get("rag_trace", {}) if isinstance(rag_result, dict) else {}
+    #把日志存入全局变量，后续用来存数据库、前端展示链路
     if rag_trace:
         _set_last_rag_context({"rag_trace": rag_trace})
-
+    #没查到任何文档 → 返回英文提示，告诉模型：库里没资料
     if not docs:
         return "No relevant documents found in the knowledge base."
 

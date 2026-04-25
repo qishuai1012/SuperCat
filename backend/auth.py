@@ -28,7 +28,7 @@ def get_db():
     finally:
         db.close()
 
-
+# 密码验证
 def verify_password(plain_password: str, password_hash: str) -> bool:
     if not plain_password or not password_hash:
         return False
@@ -61,7 +61,7 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
 
     return False
 
-
+# 密码加密
 def get_password_hash(password: str) -> str:
     if not password:
         raise ValueError("password is required")
@@ -77,7 +77,7 @@ def get_password_hash(password: str) -> str:
     digest_b64 = base64.b64encode(digest).decode("ascii")
     return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt_b64}${digest_b64}"
 
-
+# 创建登录令牌
 def create_access_token(username: str, role: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
@@ -87,7 +87,7 @@ def create_access_token(username: str, role: str) -> str:
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-
+# 用户登录验证
 def authenticate_user(db: Session, username: str, password: str) -> User | None:
     user = db.query(User).filter(User.username == username).first()
     if not user:
@@ -96,7 +96,7 @@ def authenticate_user(db: Session, username: str, password: str) -> User | None:
         return None
     return user
 
-
+ # 获取当前登录用户
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -116,13 +116,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise credentials_exception
     return user
 
-
+# 管理员权限校验
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="管理员权限不足")
     return current_user
 
-
+# 注册时判断角色
 def resolve_role(requested_role: str | None, admin_code: str | None) -> str:
     role = (requested_role or "user").strip().lower()
     if role != "admin":

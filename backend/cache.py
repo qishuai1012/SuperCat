@@ -42,6 +42,7 @@ class RedisCache:
         except Exception:
             return
 
+    #按照通配符批量删除key
     def delete_pattern(self, pattern: str) -> None:
         try:
             full_pattern = self._key(pattern)

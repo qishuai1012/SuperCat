@@ -393,27 +393,42 @@ def retrieve_expanded(state: RAGState) -> RAGState:
 
 
 def build_rag_graph():
+    # 创建一个状态图，数据格式遵循 RAGState
     graph = StateGraph(RAGState)
-    graph.add_node("retrieve_initial", retrieve_initial)
-    graph.add_node("grade_documents", grade_documents_node)
-    graph.add_node("rewrite_question", rewrite_question_node)
-    graph.add_node("retrieve_expanded", retrieve_expanded)
 
+    # 注册 4 个核心节点（就是你刚才看懂的那些函数）
+    graph.add_node("retrieve_initial", retrieve_initial)    # 1. 初始检索
+    graph.add_node("grade_documents", grade_documents_node)# 2. 评估文档
+    graph.add_node("rewrite_question", rewrite_question_node)# 3. 重写问题
+    graph.add_node("retrieve_expanded", retrieve_expanded)  # 4. 扩展检索（你刚吃透的！）
+
+    # 入口：从第一次检索开始
     graph.set_entry_point("retrieve_initial")
+
+    # 第一步执行完 → 进入评估
     graph.add_edge("retrieve_initial", "grade_documents")
+
+    # --------------------------
+    # 最关键：条件分支
+    # --------------------------
     graph.add_conditional_edges(
-        "grade_documents",
-        lambda state: state.get("route"),
+        "grade_documents",          # 从评估节点出发
+        lambda state: state["route"], # 看路由决定下一步
         {
-            "generate_answer": END,
-            "rewrite_question": "rewrite_question",
+            "generate_answer": END,      # 文档好 → 直接结束（后面生成答案）
+            "rewrite_question": "rewrite_question", # 文档差 → 重写问题
         },
     )
+
+    # 重写问题 → 执行扩展检索（你吃透的那个函数）
     graph.add_edge("rewrite_question", "retrieve_expanded")
+
+    # 扩展检索执行完 → 结束流程
     graph.add_edge("retrieve_expanded", END)
+
     return graph.compile()
 
-
+# 最终生成一个可调用的 RAG 图
 rag_graph = build_rag_graph()
 
 
