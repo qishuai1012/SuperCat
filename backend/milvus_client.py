@@ -75,6 +75,9 @@ class MilvusManager:
             schema.add_field("root_chunk_id", DataType.VARCHAR, max_length=512)
             schema.add_field("chunk_level", DataType.INT64)
 
+            # MD5 去重字段
+            schema.add_field("file_md5", DataType.VARCHAR, max_length=32)
+
             # 为两种向量分别创建索引
             index_params = client.prepare_index_params()
             
@@ -237,7 +240,8 @@ class MilvusManager:
                     "root_chunk_id": hit.get("root_chunk_id", ""),
                     "chunk_level": hit.get("chunk_level", 0),
                     "chunk_idx": hit.get("chunk_idx", 0),
-                    "score": hit.get("distance", 0.0)
+                    "score": hit.get("distance", 0.0),
+                    "score_type": "rrf",
                 })
         
         return formatted_results
@@ -280,7 +284,8 @@ class MilvusManager:
                     "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
                     "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
                     "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
-                    "score": hit.get("distance", 0.0)
+                    "score": hit.get("distance", 0.0),
+                    "score_type": "raw_similarity",
                 })
         
         return formatted_results

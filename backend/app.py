@@ -2,10 +2,22 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+import asyncio
 import os
+import logging
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import api as api_module
 from database import init_db
+
+# 配置日志系统
+logging.basicConfig(
+    level=logging.INFO,  # 改回 INFO 级别
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -17,6 +29,10 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup_init_db():
         init_db()
+
+        from embedding import embedding_service
+
+        await asyncio.to_thread(embedding_service.warmup)
 
     app.add_middleware(
         CORSMiddleware,

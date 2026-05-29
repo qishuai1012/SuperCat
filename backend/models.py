@@ -59,4 +59,5 @@ class ParentChunk(Base):
     root_chunk_id: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     chunk_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     chunk_idx: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    file_md5: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

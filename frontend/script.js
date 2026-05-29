@@ -248,11 +248,25 @@ createApp({
                                     this.messages[botMsgIdx].text += data.content;
                                 } else if (data.type === 'trace') {
                                     this.messages[botMsgIdx].ragTrace = data.rag_trace;
-                                } else if (data.type === 'rag_step') {
+                                } else if (data.type === 'rag_step' || data.type === 'step') {
                                     if (!this.messages[botMsgIdx].ragSteps) {
                                         this.messages[botMsgIdx].ragSteps = [];
                                     }
                                     this.messages[botMsgIdx].ragSteps.push(data.step);
+                                } else if (data.type === '_done') {
+                                    this.messages[botMsgIdx].isThinking = false;
+                                    if (typeof data.response === 'string' && data.response) {
+                                        this.messages[botMsgIdx].text = data.response;
+                                    }
+                                    if (data.rag_trace) {
+                                        this.messages[botMsgIdx].ragTrace = data.rag_trace;
+                                    }
+                                    if (typeof data.kb_no_result === 'boolean') {
+                                        this.messages[botMsgIdx].kbNoResult = data.kb_no_result;
+                                    }
+                                    if (data.agentic_info) {
+                                        this.messages[botMsgIdx].agenticInfo = data.agentic_info;
+                                    }
                                 } else if (data.type === 'error') {
                                     this.messages[botMsgIdx].isThinking = false;
                                     this.messages[botMsgIdx].text += `\n[Error: ${data.content}]`;

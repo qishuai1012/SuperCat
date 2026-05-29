@@ -229,6 +229,17 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
   - `bm25_state.json`：BM25 词表与 `doc_freq` / `total_docs` 等统计（稀疏检索 IDF 与入库、删除同步）。
   - `documents/`：上传文档原文件。
 - 向量库：Milvus（可由 `docker-compose` 或自建服务提供）。
+-   backend/
+  ├── agent.py (已升级)                    # 集成Agentic能力的主系统
+  ├── intelligent_router.py (新增)         # 智能路由决策
+  ├── task_decomposer.py (新增)            # 任务分解引擎
+  ├── reflection_agent.py (新增)           # 质量评估反思
+  ├── multi_agent_orchestrator.py (新增)   # 多Agent协调
+  ├── dynamic_retrieval_strategy.py (新增) # 动态检索策略
+  ├── parallel_execution.py (新增)         # 并行执行框架
+  ├── learning_system.py (新增)            # 在线学习系统
+  ├── memory_optimizer.py (新增)           # 记忆优化管理
+  └── adaptive_tuning.py (新增)            # 自适应调优
 
 ## 核心流程
 

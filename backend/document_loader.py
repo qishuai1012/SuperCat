@@ -1,15 +1,16 @@
-"""文档加载和分片服务"""
+"""文档加载和分片服务（MinerU高精度解析版）"""
 import os
 from typing import Dict, List
+from pathlib import Path
+from mineru import MinerU
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredExcelLoader
 
 
 class DocumentLoader:
     """文档加载和分片服务"""
 
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
-        # 保留原有参数以兼容外部调用；默认启用三层滑动窗口分块。
+        # 三层分块参数保持原有配置不变
         level_1_size = max(1200, chunk_size * 2)
         level_1_overlap = max(240, chunk_overlap * 2)
         level_2_size = max(600, chunk_size)
@@ -35,6 +36,8 @@ class DocumentLoader:
             add_start_index=True,
             separators=["\n\n", "\n", "。", "！", "？", "，", "、", " ", ""],
         )
+        # 初始化MinerU解析器
+        self.mineru_parser = MinerU()
 
     @staticmethod
     def _build_chunk_id(filename: str, page_number: int, level: int, index: int) -> str:
@@ -119,50 +122,58 @@ class DocumentLoader:
 
     def load_document(self, file_path: str, filename: str) -> list[dict]:
         """
-        加载单个文档并分片
+        基于MinerU加载文档并三层分片
         :param file_path: 文件路径
         :param filename: 文件名
         :return: 分片后的文档列表
         """
         file_lower = filename.lower()
+        file_path_obj = Path(file_path)
 
+        # 判定文档类型
         if file_lower.endswith(".pdf"):
             doc_type = "PDF"
-            loader = PyPDFLoader(file_path)
         elif file_lower.endswith((".docx", ".doc")):
             doc_type = "Word"
-            loader = Docx2txtLoader(file_path)
         elif file_lower.endswith((".xlsx", ".xls")):
             doc_type = "Excel"
-            loader = UnstructuredExcelLoader(file_path)
         else:
             raise ValueError(f"不支持的文件类型: {filename}")
 
         try:
-            raw_docs = loader.load()
+            # MinerU高精度解析，输出标准markdown结构化文本
+            parse_result = self.mineru_parser.process(
+                str(file_path_obj),
+                output_format="markdown"
+            )
+            full_content = parse_result.get("content", "").strip()
+            if not full_content:
+                raise Exception("文档解析未提取到有效内容")
+
             documents = []
             page_global_chunk_idx = 0
-            for doc in raw_docs:
-                base_doc = {
-                    "filename": filename,
-                    "file_path": file_path,
-                    "file_type": doc_type,
-                    "page_number": doc.metadata.get("page", 0),
-                }
-                page_chunks = self._split_page_to_three_levels(
-                    text=(doc.page_content or "").strip(),
-                    base_doc=base_doc,
-                    page_global_chunk_idx=page_global_chunk_idx,
-                )
-                page_global_chunk_idx += len(page_chunks)
-                documents.extend(page_chunks)
+            # MinerU统一规整为单页逻辑分片，兼容原有分页结构
+            base_doc = {
+                "filename": filename,
+                "file_path": file_path,
+                "file_type": doc_type,
+                "page_number": 1,
+            }
+            page_chunks = self._split_page_to_three_levels(
+                text=full_content,
+                base_doc=base_doc,
+                page_global_chunk_idx=page_global_chunk_idx
+            )
+            page_global_chunk_idx += len(page_chunks)
+            documents.extend(page_chunks)
+
             return documents
         except Exception as e:
-            raise Exception(f"处理文档失败: {str(e)}")
+            raise Exception(f"MinerU解析文档失败: {str(e)}")
 
     def load_documents_from_folder(self, folder_path: str) -> list[dict]:
         """
-        从文件夹加载所有文档并分片
+        从文件夹批量加载解析文档
         :param folder_path: 文件夹路径
         :return: 所有分片后的文档列表
         """

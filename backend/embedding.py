@@ -7,6 +7,10 @@ import threading
 from collections import Counter
 from pathlib import Path
 
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -29,7 +33,8 @@ class EmbeddingService:
     """文本向量化服务 - 密集向量本地模型 + BM25 稀疏向量（持久化统计）"""
 
     def __init__(self, state_path: Path | str | None = None):
-        self._embedder = _create_dense_embedder()
+        self._embedder = None
+        self._embedder_lock = threading.Lock()
         self._state_path = Path(state_path or os.getenv("BM25_STATE_PATH", _DEFAULT_STATE_PATH))
         self._lock = threading.Lock()
 
@@ -130,21 +135,33 @@ class EmbeddingService:
             self._recompute_avg_len()
             self._persist_unlocked()
 
+    def _get_embedder(self) -> HuggingFaceEmbeddings:
+        if self._embedder is None:
+            with self._embedder_lock:
+                if self._embedder is None:
+                    self._embedder = _create_dense_embedder()
+        return self._embedder
+
     def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        embedder = self._get_embedder()
         try:
-            return self._embedder.embed_documents(texts)
+            return embedder.embed_documents(texts)
         except Exception as e:
             error_msg = (
                 f"本地嵌入模型调用失败: {str(e)}\n"
-                f"模型: {self._embedder.model_name}\n"
-                f"设备: {self._embedder.model_kwargs.get('device', 'unknown')}\n"
+                f"模型: {embedder.model_name}\n"
+                f"设备: {embedder.model_kwargs.get('device', 'unknown')}\n"
                 f"输入文本数量: {len(texts)}\n"
                 f"输入文本长度: {[len(t) for t in texts]}\n"
                 "请检查模型是否正确加载，设备是否可用。"
             )
             raise Exception(error_msg) from e
+
+    def warmup(self) -> None:
+        """启动时预热嵌入模型，避免首个请求阻塞。"""
+        # self.get_embeddings(["warmup"])
 
     def tokenize(self, text: str) -> list[str]:
         text = text.lower()
@@ -184,7 +201,7 @@ class EmbeddingService:
             idx = self._vocab[token]
             df = self._doc_freq.get(token, 0)
             if df == 0:
-                idf = math.log((n + 1) / 1 + 1)  # 添加平滑处理，避免除零
+                idf = math.log((n + 1) / (1 + 1))  # 添加平滑处理，避免除零
             else:
                 idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
 

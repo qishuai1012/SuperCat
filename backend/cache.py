@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 from typing import Any, Optional
 
 import redis
+
+logger = logging.getLogger(__name__)
 
 
 class RedisCache:
@@ -26,31 +29,31 @@ class RedisCache:
             if not value:
                 return None
             return json.loads(value)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"缓存读取失败 key={key}: {e}")
             return None
 
     def set_json(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         try:
             payload = json.dumps(value, ensure_ascii=False)
             self._get_client().setex(self._key(key), ttl or self.default_ttl, payload)
-        except Exception:
-            return
+        except Exception as e:
+            logger.warning(f"缓存写入失败 key={key}: {e}")
 
     def delete(self, key: str) -> None:
         try:
             self._get_client().delete(self._key(key))
-        except Exception:
-            return
+        except Exception as e:
+            logger.warning(f"缓存删除失败 key={key}: {e}")
 
-    #按照通配符批量删除key
     def delete_pattern(self, pattern: str) -> None:
         try:
             full_pattern = self._key(pattern)
             keys = self._get_client().keys(full_pattern)
             if keys:
                 self._get_client().delete(*keys)
-        except Exception:
-            return
+        except Exception as e:
+            logger.warning(f"缓存批量删除失败 pattern={pattern}: {e}")
 
 
 cache = RedisCache()

@@ -1,8 +1,11 @@
+import logging
 import os
 import base64
 import hashlib
 import hmac
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -56,7 +59,11 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
 
             legacy_context = CryptContext(schemes=["bcrypt_sha256", "bcrypt"], deprecated="auto")
             return legacy_context.verify(plain_password, password_hash)
-        except Exception:
+        except ImportError:
+            logger.warning("passlib 未安装，无法验证 bcrypt 哈希，请安装 passlib[bcrypt]")
+            return False
+        except Exception as e:
+            logger.warning(f"bcrypt 密码验证异常: {e}")
             return False
 
     return False

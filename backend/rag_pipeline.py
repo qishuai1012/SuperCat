@@ -1,19 +1,30 @@
 from typing import Literal, TypedDict, List, Optional
+import json
 import os
+import re
+import time
+
+import logging
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 
-from rag_utils import retrieve_documents, step_back_expand, generate_hypothetical_document
-from tools import emit_rag_step
+from performance_config import get_performance_config
+from query_understanding.complexity import get_complexity_analyzer
+from rag.expansion import generate_hypothetical_document, step_back_expand
+from rag.retriever import retrieve_documents
+from rag_utils import build_retrieval_judgement, _merge_query_results
+from rag.trace import _format_docs, build_retrieval_trace, merge_rag_trace
+from tools import emit_rag_step, should_skip_grading
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL", "gpt-4.1")
+GRADE_MODEL = os.getenv("GRADE_MODEL", MODEL)  # 使用主模型作为默认值
 
 _grader_model = None
 _router_model = None
@@ -30,7 +41,6 @@ def _get_grader_model():
             api_key=API_KEY,
             base_url=BASE_URL,
             temperature=0,
-            stream_usage=True,
         )
     return _grader_model
 
@@ -46,22 +56,25 @@ def _get_router_model():
             api_key=API_KEY,
             base_url=BASE_URL,
             temperature=0,
-            stream_usage=True,
         )
     return _router_model
 
 
 GRADE_PROMPT = (
-    "你是一个文档相关性评估器，请判断检索到的文档是否与用户问题相关。\n\n"
-    "用户问题: {question}\n\n"
-    "检索到的文档:\n{context}\n\n"
-    "评估标准:\n"
-    "1. 如果文档标题或内容包含用户问题的关键词，评分'yes'\n"
-    "2. 如果文档讨论的技术、方法与用户问题相关，评分'yes' \n"
-    "3. 如果文档完全不相关，评分'no'\n"
-    "4. 宁可误判为相关，也不要漏掉相关文档\n\n"
-    "请严格只输出'yes'或'no'，不要输出其他内容。"
-)
+    "You are an expert grader. Your task is to assess whether a retrieved document is relevant to a user question.\n\n"
+    "Retrieved document:\n{context}\n\n"
+    "User question:\n{question}\n\n"
+    "Your job: Output ONLY a valid JSON object with a single field 'binary_score'.\n\n"
+    "Rules:\n"
+    "- If the document contains keywords or semantic meaning related to the user question, set binary_score to 'yes'.\n"
+    "- If the document is not relevant to the user question, set binary_score to 'no'.\n"
+    "- Output ONLY the JSON object. Do NOT add any explanations, comments, or additional text.\n\n"
+    "Example valid output:\n"
+    "{{\"binary_score\": \"yes\"}}"
+    "or\n"
+    "{{\"binary_score\": \"no\"}}"
+    "\n\n"
+    "Your output:")
 
 
 class GradeDocuments(BaseModel):
@@ -89,61 +102,95 @@ class RAGState(TypedDict):
     step_back_question: Optional[str]
     step_back_answer: Optional[str]
     hypothetical_doc: Optional[str]
+    skip_grading: Optional[bool]
     rag_trace: Optional[dict]
 
 
-def _format_docs(docs: List[dict]) -> str:
-    if not docs:
-        return ""
-    chunks = []
-    for i, doc in enumerate(docs, 1):
-        source = doc.get("filename", "Unknown")
-        page = doc.get("page_number", "N/A")
-        text = doc.get("text", "")
-        chunks.append(f"[{i}] {source} (Page {page}):\n{text}")
-    return "\n\n---\n\n".join(chunks)
+def _get_strategy_config_for_question(question: str):
+    complexity = get_complexity_analyzer().analyze(question)
+    return get_performance_config().get_strategy(complexity), complexity
 
 
-def _format_docs_for_grading(docs: List[dict]) -> str:
-    """为相关性评估格式化文档"""
-    if not docs:
-        return "无检索结果"
+def _decide_grading(question: str, docs: List[dict], skip_grading_signal: bool, retrieval_trace: dict | None = None) -> dict:
+    retrieval_trace = retrieval_trace or {}
+    strategy_config, complexity = _get_strategy_config_for_question(question)
+    docs_count = len(docs)
 
-    formatted = []
-    for i, doc in enumerate(docs[:3], 1):  # 只取前3个文档进行评估
-        filename = doc.get("filename", "未知文件")
-        text = doc.get("text", "")[:500]  # 限制文本长度
-        formatted.append(f"文档{i}: {filename}\n内容: {text}...")
+    decision = {
+        "grade_config_enabled": bool(strategy_config.enable_document_grading),
+        "grade_docs_count": docs_count,
+        "grade_complexity": complexity.value,
+        "grade_skip_heuristic": bool(skip_grading_signal),
+        "grade_skip_reason": None,
+        "grade_should_run": True,
+        "grade_doc_quality_threshold": strategy_config.doc_quality_threshold,
+        "grade_min_docs_for_skip": strategy_config.min_docs_for_skip_grading,
+    }
 
-    return "\n\n".join(formatted)
+    if docs_count == 0:
+        decision["grade_should_run"] = False
+        decision["grade_skip_reason"] = "no_docs"
+        return decision
+
+    if not strategy_config.enable_document_grading:
+        decision["grade_should_run"] = False
+        decision["grade_skip_reason"] = "config_disabled"
+        return decision
+
+    if retrieval_trace.get("no_relevant_docs"):
+        decision["grade_should_run"] = False
+        decision["grade_skip_reason"] = "retrieval_reported_no_relevant_docs"
+        return decision
+
+    if skip_grading_signal and docs_count >= strategy_config.min_docs_for_skip_grading:
+        decision["grade_should_run"] = False
+        decision["grade_skip_reason"] = "heuristic_skip_with_enough_docs"
+        return decision
+
+    return decision
 
 
-def _simple_relevance_check(question: str, docs: List[dict]) -> bool:
-    """简单的关键词匹配相关性检查"""
-    if not docs:
-        return False
+def _parse_grade_response(raw_content: str) -> tuple[str, str]:
+    text = (raw_content or "").strip()
+    if not text:
+        raise ValueError("empty grader response")
 
-    # 提取问题中的关键词
-    keywords = set()
-    for word in question.split():
-        if len(word) > 1:  # 忽略单字
-            keywords.add(word.lower())
+    try:
+        payload = json.loads(text)
+        score = str(payload.get("binary_score", "")).strip().lower()
+        if score in ("yes", "no"):
+            return score, "json"
+    except Exception:
+        pass
 
-    # 检查文档中是否包含关键词
-    for doc in docs:
-        text = (doc.get("filename", "") + " " + doc.get("text", "")).lower()
-        if any(keyword in text for keyword in keywords):
-            return True
+    json_match = re.search(r"\{[\s\S]*?\}", text)
+    if json_match:
+        payload = json.loads(json_match.group())
+        score = str(payload.get("binary_score", "")).strip().lower()
+        if score in ("yes", "no"):
+            return score, "json_extract"
 
-    return False
+    normalized = text.lower()
+    if normalized in ("yes", '"yes"', "'yes'"):
+        return "yes", "literal"
+    if normalized in ("no", '"no"', "'no'"):
+        return "no", "literal"
+
+    raise ValueError(f"unrecognized grader response: {text[:80]}")
 
 
 def retrieve_initial(state: RAGState) -> RAGState:
     query = state["question"]
+    logger.info(f"🔵 retrieve_initial节点开始执行")
     emit_rag_step("🔍", "正在检索知识库...", f"查询: {query[:50]}")
+    started_at = time.perf_counter()
     retrieved = retrieve_documents(query, top_k=5)
+    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    logger.info(f"🔵 retrieve_initial节点执行完成")
     results = retrieved.get("docs", [])
-    retrieve_meta = retrieved.get("meta", {})
+    retrieve_meta = dict(retrieved.get("meta", {}) or {})
+    retrieve_meta["retrieval_duration_ms"] = duration_ms
+    retrieve_meta["model_versions"] = {"grade_model": GRADE_MODEL, "rewrite_router_model": MODEL, "generation_model": MODEL}
     context = _format_docs(results)
     emit_rag_step(
         "🧱",
@@ -163,28 +210,14 @@ def retrieve_initial(state: RAGState) -> RAGState:
         ),
     )
     emit_rag_step("✅", f"检索完成，找到 {len(results)} 个片段", f"模式: {retrieve_meta.get('retrieval_mode', 'hybrid')}")
-    rag_trace = {
-        "tool_used": True,
-        "tool_name": "search_knowledge_base",
-        "query": query,
-        "expanded_query": query,
-        "retrieved_chunks": results,
-        "initial_retrieved_chunks": results,
-        "retrieval_stage": "initial",
-        "rerank_enabled": retrieve_meta.get("rerank_enabled"),
-        "rerank_applied": retrieve_meta.get("rerank_applied"),
-        "rerank_model": retrieve_meta.get("rerank_model"),
-        "rerank_endpoint": retrieve_meta.get("rerank_endpoint"),
-        "rerank_error": retrieve_meta.get("rerank_error"),
-        "retrieval_mode": retrieve_meta.get("retrieval_mode"),
-        "candidate_k": retrieve_meta.get("candidate_k"),
-        "leaf_retrieve_level": retrieve_meta.get("leaf_retrieve_level"),
-        "auto_merge_enabled": retrieve_meta.get("auto_merge_enabled"),
-        "auto_merge_applied": retrieve_meta.get("auto_merge_applied"),
-        "auto_merge_threshold": retrieve_meta.get("auto_merge_threshold"),
-        "auto_merge_replaced_chunks": retrieve_meta.get("auto_merge_replaced_chunks"),
-        "auto_merge_steps": retrieve_meta.get("auto_merge_steps"),
-    }
+    rag_trace = build_retrieval_trace(
+        query=query,
+        docs=results,
+        retrieval_meta=retrieve_meta,
+        retrieval_stage="initial",
+        expanded_query=query,
+        trace=state.get("rag_trace"),
+    )
     return {
         "query": query,
         "docs": results,
@@ -194,85 +227,150 @@ def retrieve_initial(state: RAGState) -> RAGState:
 
 
 def grade_documents_node(state: RAGState) -> RAGState:
-    grader = _get_grader_model()
-    emit_rag_step("📊", "正在评估文档相关性...")
-    print(f"DEBUG: Grader model: {GRADE_MODEL}, API key present: {bool(API_KEY)}")  # 调试信息
-    if not grader:
-        # 如果没有评估模型，默认认为相关
-        emit_rag_step("✅", "文档相关性评估通过", "评分: yes (默认)")
-        return {"route": "generate_answer", "rag_trace": state.get("rag_trace", {})}
-
+    started_at = time.perf_counter()
+    docs = state.get("docs") or []
     question = state["question"]
-    docs = state.get("docs", [])
+    skip_grading_signal = bool(state.get("skip_grading") or should_skip_grading(question))
+    rag_trace = state.get("rag_trace", {}) or {}
+    decision = _decide_grading(
+        question=question,
+        docs=docs,
+        skip_grading_signal=skip_grading_signal,
+        retrieval_trace=rag_trace,
+    )
+    emit_rag_step("📊", "正在评估文档相关性...")
 
-    # 如果没有检索到文档，直接生成答案
+    base_trace = {
+        "grade_config_enabled": decision["grade_config_enabled"],
+        "grade_docs_count": decision["grade_docs_count"],
+        "grade_complexity": decision["grade_complexity"],
+        "grade_skip_heuristic": decision["grade_skip_heuristic"],
+        "grade_skip_reason": decision["grade_skip_reason"],
+        "grade_doc_quality_threshold": decision["grade_doc_quality_threshold"],
+        "grade_min_docs_for_skip": decision["grade_min_docs_for_skip"],
+        "grading_duration_ms": None,
+    }
+
     if not docs:
-        emit_rag_step("⚠️", "未检索到相关文档，将直接生成答案")
-        return {"route": "generate_answer", "rag_trace": state.get("rag_trace", {})}
+        logger.info("No documents retrieved; returning KB no-result route without grading or rewrite")
+        rag_trace = merge_rag_trace(
+            rag_trace,
+            **{**base_trace, "grading_duration_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+            grade_score="no_docs",
+            grade_route="generate_answer",
+            rewrite_needed=False,
+            grade_skipped=True,
+            grade_parser_mode="not_run",
+            kb_no_result=True,
+        )
+        emit_rag_step("⚠️", "未检索到相关文档", "直接返回知识库无结果")
+        return {"route": "generate_answer", "rag_trace": rag_trace}
 
-    # 使用优化后的文档格式化
-    context = _format_docs_for_grading(docs)
+    if not decision["grade_should_run"]:
+        logger.info(f"Skipping document grading: {decision['grade_skip_reason']}")
+        rag_trace = merge_rag_trace(
+            rag_trace,
+            **{**base_trace, "grading_duration_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+            grade_score="skipped",
+            grade_route="generate_answer",
+            rewrite_needed=False,
+            grade_skipped=True,
+            grade_parser_mode="not_run",
+            kb_no_result=bool(rag_trace.get("kb_no_result", False)),
+        )
+        emit_rag_step("⚡", "跳过文档评分", f"原因: {decision['grade_skip_reason']}")
+        return {"route": "generate_answer", "rag_trace": rag_trace}
 
-    # 如果没有文档内容，直接生成答案
-    if context == "无检索结果":
-        emit_rag_step("⚠️", "未检索到文档，将直接生成答案")
-        return {"route": "generate_answer", "rag_trace": state.get("rag_trace", {})}
+    grader = _get_grader_model()
+    logger.info(
+        f"Grader model: {GRADE_MODEL}, API key present: {bool(API_KEY)}, "
+        f"skip_signal={skip_grading_signal}, complexity={decision['grade_complexity']}"
+    )
 
+    if not grader:
+        rag_trace = merge_rag_trace(
+            rag_trace,
+            **{
+                **base_trace,
+                "grade_skip_reason": "grader_unavailable",
+                "grading_duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+            grade_score="unknown",
+            grade_route="rewrite_question",
+            rewrite_needed=True,
+            grade_skipped=False,
+            grade_parser_mode="not_run",
+            kb_no_result=False,
+        )
+        return {"route": "rewrite_question", "rag_trace": rag_trace}
+
+    context = state.get("context", "")
     prompt = GRADE_PROMPT.format(question=question, context=context)
-    #原始代码
-    # response = grader.with_structured_output(GradeDocuments).invoke([
-    #     {"role": "user", "content": prompt}
-    # ])
-    # score = (response.binary_score or "").strip().lower()
-    #修复----
+    score = "no"
+    parser_mode = "fallback_no"
+
     try:
-        print(f"DEBUG: 尝试结构化输出调用")  # 调试信息
         response = grader.with_structured_output(GradeDocuments).invoke(
             [{"role": "user", "content": prompt}]
         )
-        score = (response.binary_score or "").strip().lower()
-        print(f"DEBUG: 结构化输出成功，得分: {score}")  # 调试信息
-    except Exception as e:
-        print(f"DEBUG: 结构化输出失败: {e}")  # 调试信息
-        # 如果结构化输出失败，尝试普通调用并手动解析
+        if response and hasattr(response, "binary_score"):
+            raw_score = str(response.binary_score).strip().lower()
+            if raw_score == "binary_score":
+                raise ValueError("模型返回了字段名作为值")
+            if raw_score in ("yes", "no"):
+                score = raw_score
+                parser_mode = "structured"
+            else:
+                raise ValueError(f"unexpected structured score: {raw_score}")
+    except Exception:
         try:
-            print(f"DEBUG: 尝试普通调用")  # 调试信息
             raw_response = grader.invoke([{"role": "user", "content": prompt}])
-            content = str(raw_response.content if hasattr(raw_response, 'content') else raw_response)
-            print(f"DEBUG: 普通调用响应: {content}")  # 调试信息
-            # 简单地从文本中提取yes/no
-            content_lower = content.lower()
-            if "yes" in content_lower or "relevant" in content_lower or "相关" in content:
-                score = "yes"
-            elif "no" in content_lower and "not" not in content_lower:
-                score = "no"
-            else:
-                score = "yes"  # 默认认为相关，更宽松的标准
-            print(f"DEBUG: 解析得分: {score}")  # 调试信息
-        except Exception as e2:
-            print(f"DEBUG: 普通调用也失败: {e2}")  # 调试信息
-            # 如果LLM评估失败，使用简单的关键词匹配
-            if _simple_relevance_check(question, docs):
-                score = "yes"
-            else:
-                score = "no"
+            content = str(raw_response.content if hasattr(raw_response, "content") else raw_response)
+            score, parser_mode = _parse_grade_response(content)
+        except Exception:
+            score = "no"
+            parser_mode = "fallback_no"
 
-    # 无论评分如何都生成答案，不再循环重写
-    route = "generate_answer"
-    if score == "yes":
+    route = "generate_answer" if score == "yes" else "rewrite_question"
+    if route == "generate_answer":
         emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
     else:
-        emit_rag_step("⚠️", "文档相关性不足，将基于有限信息生成答案", f"评分: {score}")
+        emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {score}")
 
-    return {"route": route, "rag_trace": state.get("rag_trace", {})}
+    rag_trace = merge_rag_trace(
+        rag_trace,
+        **{
+            **base_trace,
+            "grade_skip_reason": None,
+            "grading_duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        },
+        grade_score=score,
+        grade_route=route,
+        rewrite_needed=route == "rewrite_question",
+        grade_skipped=False,
+        grade_parser_mode=parser_mode,
+        kb_no_result=False,
+    )
+    return {"route": route, "rag_trace": rag_trace}
 
 
 def rewrite_question_node(state: RAGState) -> RAGState:
+    started_at = time.perf_counter()
     question = state["question"]
     emit_rag_step("✏️", "正在重写查询...")
+
+    strategy = state.get("expansion_type")
     router = _get_router_model()
-    strategy = "step_back"
-    if router:
+    rag_trace = state.get("rag_trace", {}) or {}
+    source = None
+
+    if strategy:
+        if rag_trace.get("route_expansion_hint"):
+            source = "expansion_hint"
+        elif rag_trace.get("legacy_route_strategy"):
+            source = "legacy_route"
+
+    if not strategy and router:
         prompt = (
             "请根据用户问题选择最合适的查询扩展策略，仅输出策略名。\n"
             "- step_back：包含具体名称、日期、代码等细节，需要先理解通用概念的问题。\n"
@@ -285,8 +383,14 @@ def rewrite_question_node(state: RAGState) -> RAGState:
                 [{"role": "user", "content": prompt}]
             )
             strategy = decision.strategy
+            source = "rag_router"
         except Exception:
             strategy = "step_back"
+            source = "default"
+
+    if not strategy:
+        strategy = "step_back"
+        source = "default"
 
     expanded_query = question
     step_back_question = ""
@@ -304,11 +408,17 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         emit_rag_step("📝", "HyDE 假设性文档生成中...")
         hypothetical_doc = generate_hypothetical_document(question)
 
-    rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update({
-        "rewrite_strategy": strategy,
-        "rewrite_query": expanded_query,
-    })
+    rag_trace = merge_rag_trace(
+        rag_trace,
+        rewrite_strategy=strategy,
+        rewrite_duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        rewrite_query=expanded_query,
+        query_expansion_owner="rag_pipeline",
+        hyde_generated_count=1 if hypothetical_doc else 0,
+        step_back_generated=bool(step_back_question or step_back_answer),
+        rewrite_strategy_source=source or "default",
+        kb_no_result=False,
+    )
 
     return {
         "expansion_type": strategy,
@@ -321,14 +431,19 @@ def rewrite_question_node(state: RAGState) -> RAGState:
 
 
 def retrieve_expanded(state: RAGState) -> RAGState:
+    started_at = time.perf_counter()
     strategy = state.get("expansion_type") or "step_back"
     emit_rag_step("🔄", "使用扩展查询重新检索...", f"策略: {strategy}")
-    results: List[dict] = []
+
+    result_sets: List[Dict[str, Any]] = []
+    rerank_requested_any = False
+    rerank_available_any = False
     rerank_applied_any = False
     rerank_enabled_any = False
     rerank_model = None
     rerank_endpoint = None
     rerank_errors = []
+    rerank_skip_reasons = []
     retrieval_mode = None
     candidate_k = None
     leaf_retrieve_level = None
@@ -341,7 +456,7 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     if strategy in ("hyde", "complex"):
         hypothetical_doc = state.get("hypothetical_doc") or generate_hypothetical_document(state["question"])
         retrieved_hyde = retrieve_documents(hypothetical_doc, top_k=5)
-        results.extend(retrieved_hyde.get("docs", []))
+        result_sets.append({"variant": "hyde", "docs": retrieved_hyde.get("docs", [])})
         hyde_meta = retrieved_hyde.get("meta", {})
         emit_rag_step(
             "🧱",
@@ -352,12 +467,16 @@ def retrieve_expanded(state: RAGState) -> RAGState:
                 f"合并替换 {hyde_meta.get('auto_merge_replaced_chunks', 0)}"
             ),
         )
+        rerank_requested_any = rerank_requested_any or bool(hyde_meta.get("rerank_requested"))
+        rerank_available_any = rerank_available_any or bool(hyde_meta.get("rerank_available"))
         rerank_applied_any = rerank_applied_any or bool(hyde_meta.get("rerank_applied"))
         rerank_enabled_any = rerank_enabled_any or bool(hyde_meta.get("rerank_enabled"))
         rerank_model = rerank_model or hyde_meta.get("rerank_model")
         rerank_endpoint = rerank_endpoint or hyde_meta.get("rerank_endpoint")
         if hyde_meta.get("rerank_error"):
             rerank_errors.append(f"hyde:{hyde_meta.get('rerank_error')}")
+        if hyde_meta.get("rerank_skip_reason"):
+            rerank_skip_reasons.append(f"hyde:{hyde_meta.get('rerank_skip_reason')}")
         retrieval_mode = retrieval_mode or hyde_meta.get("retrieval_mode")
         candidate_k = candidate_k or hyde_meta.get("candidate_k")
         leaf_retrieve_level = leaf_retrieve_level or hyde_meta.get("leaf_retrieve_level")
@@ -367,26 +486,30 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(hyde_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(hyde_meta.get("auto_merge_steps") or 0)
 
-    if strategy in ("step_back", "complex"):
+    if strategy in ("step_back", "complex", "direct"):
         expanded_query = state.get("expanded_query") or state["question"]
         retrieved_stepback = retrieve_documents(expanded_query, top_k=5)
-        results.extend(retrieved_stepback.get("docs", []))
+        result_sets.append({"variant": "step_back" if strategy != "direct" else "direct", "docs": retrieved_stepback.get("docs", [])})
         step_meta = retrieved_stepback.get("meta", {})
         emit_rag_step(
             "🧱",
-            "Step-back 三级检索",
+            "Step-back 三级检索" if strategy != "direct" else "Direct 三级检索",
             (
                 f"L{step_meta.get('leaf_retrieve_level', 3)} 召回，"
                 f"候选 {step_meta.get('candidate_k', 0)}，"
                 f"合并替换 {step_meta.get('auto_merge_replaced_chunks', 0)}"
             ),
         )
+        rerank_requested_any = rerank_requested_any or bool(step_meta.get("rerank_requested"))
+        rerank_available_any = rerank_available_any or bool(step_meta.get("rerank_available"))
         rerank_applied_any = rerank_applied_any or bool(step_meta.get("rerank_applied"))
         rerank_enabled_any = rerank_enabled_any or bool(step_meta.get("rerank_enabled"))
         rerank_model = rerank_model or step_meta.get("rerank_model")
         rerank_endpoint = rerank_endpoint or step_meta.get("rerank_endpoint")
         if step_meta.get("rerank_error"):
             rerank_errors.append(f"step_back:{step_meta.get('rerank_error')}")
+        if step_meta.get("rerank_skip_reason"):
+            rerank_skip_reasons.append(f"step_back:{step_meta.get('rerank_skip_reason')}")
         retrieval_mode = retrieval_mode or step_meta.get("retrieval_mode")
         candidate_k = candidate_k or step_meta.get("candidate_k")
         leaf_retrieve_level = leaf_retrieve_level or step_meta.get("leaf_retrieve_level")
@@ -396,34 +519,22 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(step_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(step_meta.get("auto_merge_steps") or 0)
 
-    deduped = []
-    seen = set()
-    for item in results:
-        key = (item.get("filename"), item.get("page_number"), item.get("text"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
+    fused_docs, fusion_meta = _merge_query_results(result_sets, top_k=max(5, len(result_sets) * 5)) if result_sets else ([], {"multi_query_enabled": False, "multi_query_variants": [], "multi_query_docs_total": 0, "multi_query_docs_unique": 0, "multi_query_docs_returned": 0, "multi_query_hits": {}})
 
-    # 扩展阶段可能合并了多路召回（如 hyde + step_back），
-    # 这里统一重排展示名次，避免出现 1,2,3,4,5,4,5 这类重复名次。
-    for idx, item in enumerate(deduped, 1):
-        item["rrf_rank"] = idx
-
-    context = _format_docs(deduped)
-    emit_rag_step("✅", f"扩展检索完成，共 {len(deduped)} 个片段")
-    rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update({
-        "expanded_query": state.get("expanded_query") or state["question"],
-        "step_back_question": state.get("step_back_question", ""),
-        "step_back_answer": state.get("step_back_answer", ""),
-        "hypothetical_doc": state.get("hypothetical_doc", ""),
-        "expansion_type": strategy,
-        "retrieved_chunks": deduped,
-        "expanded_retrieved_chunks": deduped,
-        "retrieval_stage": "expanded",
+    context = _format_docs(fused_docs)
+    emit_rag_step("✅", f"扩展检索完成，共 {len(fused_docs)} 个片段")
+    retrieval_meta = {
+        "query_expansion_owner": "rag_pipeline",
+        "retrieval_duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "model_versions": {"grade_model": GRADE_MODEL, "rewrite_router_model": MODEL, "generation_model": MODEL},
+        "hyde_generated_count": 1 if state.get("hypothetical_doc") else 0,
+        "step_back_generated": bool(state.get("step_back_question") or state.get("step_back_answer")),
+        "expanded_retrieval_count": (1 if strategy in ("hyde", "complex") else 0) + (1 if strategy in ("step_back", "complex", "direct") else 0),
+        "rerank_requested": rerank_requested_any,
+        "rerank_available": rerank_available_any,
         "rerank_enabled": rerank_enabled_any,
         "rerank_applied": rerank_applied_any,
+        "rerank_skip_reason": None if rerank_applied_any else "; ".join(rerank_skip_reasons) if rerank_skip_reasons else None,
         "rerank_model": rerank_model,
         "rerank_endpoint": rerank_endpoint,
         "rerank_error": "; ".join(rerank_errors) if rerank_errors else None,
@@ -435,8 +546,26 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         "auto_merge_threshold": auto_merge_threshold,
         "auto_merge_replaced_chunks": auto_merge_replaced_chunks,
         "auto_merge_steps": auto_merge_steps,
-    })
-    return {"docs": deduped, "context": context, "rag_trace": rag_trace}
+        "kb_no_result": not fused_docs,
+        "no_relevant_docs": not fused_docs,
+        **fusion_meta,
+    }
+    rag_trace = build_retrieval_trace(
+        query=state["question"],
+        docs=fused_docs,
+        retrieval_meta=retrieval_meta,
+        retrieval_stage="expanded",
+        expanded_query=state.get("expanded_query") or state["question"],
+        trace=state.get("rag_trace"),
+    )
+    rag_trace = merge_rag_trace(
+        rag_trace,
+        step_back_question=state.get("step_back_question", ""),
+        step_back_answer=state.get("step_back_answer", ""),
+        hypothetical_doc=state.get("hypothetical_doc", ""),
+        expansion_type=strategy,
+    )
+    return {"docs": fused_docs, "context": context, "rag_trace": rag_trace}
 
 
 def build_rag_graph():
@@ -470,7 +599,7 @@ def build_rag_graph():
     # 重写问题 → 执行扩展检索（你吃透的那个函数）
     graph.add_edge("rewrite_question", "retrieve_expanded")
 
-    # 扩展检索执行完 → 结束流程（不再重新评估）
+    # 扩展检索执行完 → 结束流程
     graph.add_edge("retrieve_expanded", END)
 
     return graph.compile()
@@ -479,17 +608,53 @@ def build_rag_graph():
 rag_graph = build_rag_graph()
 
 
-def run_rag_graph(question: str) -> dict:
+def run_rag_graph(question: str, skip_grading: bool = False, expansion_hint: str | None = None) -> dict:
+    legacy_strategy = None
+    if question.startswith("[ROUTE:"):
+        end = question.find("]")
+        if end > 0:
+            legacy_strategy = question[7:end].strip()
+            question = question[end+1:].strip()
+
+    strategy = expansion_hint or legacy_strategy
+
     return rag_graph.invoke({
         "question": question,
         "query": question,
         "context": "",
         "docs": [],
         "route": None,
-        "expansion_type": None,
+        "expansion_type": strategy,
         "expanded_query": None,
         "step_back_question": None,
         "step_back_answer": None,
         "hypothetical_doc": None,
-        "rag_trace": None,
+        "skip_grading": skip_grading,
+        "rag_trace": {
+            "route_expansion_hint": expansion_hint,
+            "legacy_route_strategy": legacy_strategy,
+        },
     })
+
+
+def evaluate_rag_retrieval(question: str, relevant_ids: List[str], *, k: int | None = None, skip_grading: bool = False, expansion_hint: str | None = None) -> dict:
+    from learning_system import get_online_learning_system
+
+    rag_result = run_rag_graph(question, skip_grading=skip_grading, expansion_hint=expansion_hint)
+    docs = rag_result.get("docs") or []
+    rag_trace = rag_result.get("rag_trace") or {}
+    judged_result = build_retrieval_judgement(
+        query=question,
+        docs=docs,
+        relevant_ids=relevant_ids,
+        k=k,
+        meta=rag_trace if isinstance(rag_trace, dict) else {},
+    )
+    metrics = get_online_learning_system().evaluate_retrieval_metrics([judged_result])
+    return {
+        "question": question,
+        "judged_result": judged_result,
+        "metrics": metrics,
+        "rag_trace": rag_trace,
+        "docs": docs,
+    }

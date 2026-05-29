@@ -1,7 +1,8 @@
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import List, Tuple, Dict, Any
 import os
 import json
+import hashlib
 import logging
 import requests
 from dotenv import load_dotenv
@@ -9,6 +10,11 @@ from dotenv import load_dotenv
 from milvus_client import MilvusManager
 from embedding import embedding_service as _embedding_service
 from parent_chunk_store import ParentChunkStore
+from performance_config import get_performance_config
+from query_understanding.service import get_query_understanding_service
+from query_understanding.types import QueryComplexity, RetrievalStrategy
+from smart_cache import get_smart_cache
+
 from langchain.chat_models import init_chat_model
 
 logger = logging.getLogger(__name__)
@@ -31,6 +37,7 @@ LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))
 # 全局初始化检索依赖（与 api 共用 embedding_service，保证 BM25 状态一致）
 _milvus_manager = MilvusManager()
 _parent_chunk_store = ParentChunkStore()
+_smart_cache = get_smart_cache()
 
 _stepback_model = None
 
@@ -47,6 +54,86 @@ def _ensure_milvus_initialized():
         except Exception as e:
             logger.warning("Milvus 集合初始化失败: %s", e)
             raise
+
+
+def _chunk_key(doc: dict) -> tuple:
+    return (doc.get("chunk_id") or "", doc.get("filename") or "", doc.get("page_number") or "", doc.get("text") or "")
+
+
+def _doc_identifier(doc: dict) -> str:
+    stable_source = "|".join([
+        str(doc.get("chunk_id") or ""),
+        str(doc.get("parent_chunk_id") or ""),
+        str(doc.get("root_chunk_id") or ""),
+        str(doc.get("filename") or ""),
+        str(doc.get("page_number") or ""),
+        str(doc.get("text") or "")[:200],
+    ])
+    return hashlib.sha1(stable_source.encode("utf-8")).hexdigest()[:16]
+
+
+def _rank_fusion_score(doc: dict, position: int) -> float:
+    base_score = float(doc.get("score") or 0.0)
+    rerank_score = float(doc.get("rerank_score") or 0.0)
+    rrf_rank = int(doc.get("rrf_rank") or position or 1)
+    return base_score + rerank_score + (1.0 / (60 + rrf_rank))
+
+
+def _merge_query_results(result_sets: List[Dict[str, Any]], top_k: int) -> tuple[list[dict], Dict[str, Any]]:
+    fused: Dict[tuple, dict] = {}
+    query_hits: Counter = Counter()
+    for result in result_sets:
+        docs = result.get("docs", []) or []
+        variant = result.get("variant", "unknown")
+        for pos, doc in enumerate(docs, 1):
+            key = _chunk_key(doc)
+            query_hits[variant] += 1
+            current = fused.get(key)
+            candidate = dict(doc)
+            candidate["fused_query_variant"] = variant
+            candidate["fusion_components"] = {
+                "base_score": float(candidate.get("score") or 0.0),
+                "rerank_score": float(candidate.get("rerank_score") or 0.0),
+                "rrf_rank": int(candidate.get("rrf_rank") or pos or 1),
+            }
+            candidate["fusion_components"]["rrf_bonus"] = round(1.0 / (60 + candidate["fusion_components"]["rrf_rank"]), 8)
+            candidate["fusion_score"] = _rank_fusion_score(candidate, pos)
+            source_info = {
+                "variant": variant,
+                "doc_id": _doc_identifier(candidate),
+                "position": pos,
+                "score": candidate["fusion_score"],
+            }
+            if current is None or candidate["fusion_score"] > current.get("fusion_score", 0.0):
+                merged_sources = list(current.get("fused_sources") or []) if current is not None else []
+                merged_sources.append(source_info)
+                merged_variants = list(current.get("fused_from_variants") or []) if current is not None else []
+                merged_variants.append(variant)
+                candidate["fused_from_variants"] = list(dict.fromkeys(merged_variants))
+                candidate["fused_sources"] = merged_sources
+                fused[key] = candidate
+            else:
+                current["fused_from_variants"] = list(dict.fromkeys((current.get("fused_from_variants") or []) + [variant]))
+                current["fused_sources"] = list(current.get("fused_sources") or []) + [source_info]
+    fused_docs = sorted(
+        fused.values(),
+        key=lambda item: (
+            float(item.get("fusion_score", item.get("score", 0.0)) or 0.0),
+            len(item.get("fused_from_variants") or []),
+            -int(item.get("fusion_components", {}).get("rrf_rank") or item.get("rrf_rank") or 0),
+        ),
+        reverse=True,
+    )[:top_k]
+    for idx, item in enumerate(fused_docs, 1):
+        item["fusion_rank"] = idx
+    return fused_docs, {
+        "multi_query_enabled": len(result_sets) > 1,
+        "multi_query_variants": [item.get("variant") for item in result_sets],
+        "multi_query_docs_total": sum(len(item.get("docs", []) or []) for item in result_sets),
+        "multi_query_docs_unique": len(fused),
+        "multi_query_docs_returned": len(fused_docs),
+        "multi_query_hits": dict(query_hits),
+    }
 
 #获取重排序接口地址
 def _get_rerank_endpoint() -> str:
@@ -83,11 +170,19 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
             merged_docs.append(doc)
             continue
         parent_doc = dict(parent_map[parent_id])
-        child_score = doc.get("score", 0.0)
-        parent_score = parent_doc.get("score", 0.0)
+        child_score = float(doc.get("score", 0.0) or 0.0)
+        parent_score = float(parent_doc.get("score", 0.0) or 0.0)
+        child_fusion_score = float(doc.get("fusion_score", child_score) or child_score)
+        parent_fusion_score = float(parent_doc.get("fusion_score", parent_score) or parent_score)
         parent_doc["score"] = max(parent_score, child_score)
+        parent_doc["fusion_score"] = max(parent_fusion_score, child_fusion_score)
+        parent_doc["rerank_score"] = float(doc.get("rerank_score", parent_doc.get("rerank_score", 0.0)) or 0.0)
+        parent_doc["rrf_rank"] = int(doc.get("rrf_rank") or parent_doc.get("rrf_rank") or 0)
+        parent_doc["fused_from_variants"] = list(doc.get("fused_from_variants") or [])
+        parent_doc["fused_sources"] = list(doc.get("fused_sources") or [])
         parent_doc["merged_from_children"] = True
         parent_doc["merged_child_count"] = len(groups[parent_id])
+        parent_doc["merged_child_ids"] = [child.get("chunk_id") for child in groups[parent_id] if child.get("chunk_id")]
         merged_docs.append(parent_doc)
         merged_count += 1
 
@@ -103,10 +198,10 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
     return deduped, merged_count
 
 #两层合并（L3→L2 → L2→L1）
-def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
-    if not AUTO_MERGE_ENABLED or not docs:
+def _auto_merge_documents(docs: List[dict], top_k: int, auto_merge_enabled: bool) -> Tuple[List[dict], Dict[str, Any]]:
+    if not auto_merge_enabled or not docs:
         return docs[:top_k], {
-            "auto_merge_enabled": AUTO_MERGE_ENABLED,
+            "auto_merge_enabled": auto_merge_enabled,
             "auto_merge_applied": False,
             "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
             "auto_merge_replaced_chunks": 0,
@@ -117,12 +212,12 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
     merged_docs, merged_count_l3_l2 = _merge_to_parent_level(docs, threshold=AUTO_MERGE_THRESHOLD)
     merged_docs, merged_count_l2_l1 = _merge_to_parent_level(merged_docs, threshold=AUTO_MERGE_THRESHOLD)
 
-    merged_docs.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    merged_docs.sort(key=lambda item: item.get("fusion_score", item.get("score", 0.0)), reverse=True)
     merged_docs = merged_docs[:top_k]
 
     replaced_count = merged_count_l3_l2 + merged_count_l2_l1
     return merged_docs, {
-        "auto_merge_enabled": AUTO_MERGE_ENABLED,
+        "auto_merge_enabled": auto_merge_enabled,
         "auto_merge_applied": replaced_count > 0,
         "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
         "auto_merge_replaced_chunks": replaced_count,
@@ -130,17 +225,29 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
     }
 
  # 重排序（让最相关的排前面）
-def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
-    docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
+def _rerank_documents(query: str, docs: List[dict], top_k: int, rerank_requested: bool) -> Tuple[List[dict], Dict[str, Any]]:
+    docs_with_rank = [{**doc, "rrf_rank": i, "rerank_source_score": doc.get("score", 0.0)} for i, doc in enumerate(docs, 1)]
+    rerank_available = bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST)
     meta: Dict[str, Any] = {
-        "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+        "rerank_requested": bool(rerank_requested),
+        "rerank_available": rerank_available,
+        "rerank_enabled": bool(rerank_requested and rerank_available),
         "rerank_applied": False,
+        "rerank_skip_reason": None,
         "rerank_model": RERANK_MODEL,
         "rerank_endpoint": _get_rerank_endpoint(),
         "rerank_error": None,
         "candidate_count": len(docs_with_rank),
+        "rerank_fallback_used": False,
     }
-    if not docs_with_rank or not meta["rerank_enabled"]:
+    if not docs_with_rank:
+        meta["rerank_skip_reason"] = "no_docs"
+        return docs_with_rank[:top_k], meta
+    if not rerank_requested:
+        meta["rerank_skip_reason"] = "strategy_disabled"
+        return docs_with_rank[:top_k], meta
+    if not rerank_available:
+        meta["rerank_skip_reason"] = "capability_unavailable"
         return docs_with_rank[:top_k], meta
 
     payload = {
@@ -156,7 +263,6 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "Authorization": f"Bearer {RERANK_API_KEY}",
     }
     try:
-        meta["rerank_applied"] = True
         response = requests.post(
             meta["rerank_endpoint"],
             headers=headers,
@@ -165,27 +271,39 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         )
         if response.status_code >= 400:
             meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+            meta["rerank_fallback_used"] = True
             return docs_with_rank[:top_k], meta
 
         items = response.json().get("results", [])
         reranked = []
+        used_indexes = set()
         for item in items:
             idx = item.get("index")
             if isinstance(idx, int) and 0 <= idx < len(docs_with_rank):
+                used_indexes.add(idx)
                 doc = dict(docs_with_rank[idx])
                 score = item.get("relevance_score")
                 if score is not None:
                     doc["rerank_score"] = score
+                doc["fusion_score"] = float(doc.get("score") or 0.0) + float(doc.get("rerank_score") or 0.0)
                 reranked.append(doc)
 
         if reranked:
-            return reranked[:top_k], meta
+            meta["rerank_applied"] = True
+            remaining = [dict(doc) for idx, doc in enumerate(docs_with_rank) if idx not in used_indexes]
+            for doc in remaining:
+                doc["fusion_score"] = float(doc.get("score") or 0.0)
+            merged_reranked = reranked + remaining
+            merged_reranked.sort(key=lambda item: float(item.get("fusion_score", item.get("score", 0.0)) or 0.0), reverse=True)
+            return merged_reranked[:top_k], meta
 
     except requests.RequestException as e:
         meta["rerank_error"] = f"request_err: {str(e)}"
+        meta["rerank_fallback_used"] = True
         logger.exception("重排序接口请求异常")
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
         meta["rerank_error"] = f"parse_err: {str(e)}"
+        meta["rerank_fallback_used"] = True
         logger.exception("重排序结果解析异常")
     return docs_with_rank[:top_k], meta
 
@@ -268,76 +386,242 @@ def step_back_expand(query: str) -> dict:
         "expanded_query": expanded_query,
     }
 
+def _build_retrieval_cache_key_payload(query: str, query_analysis: Any, retrieval_config: Any, top_k: int, auto_merge_enabled: bool) -> Dict[str, Any]:
+    normalized_query = get_smart_cache()._normalize_query_text(query)
+    return {
+        "query": query,
+        "canonical_query": normalized_query,
+        "top_k": top_k,
+        "complexity": getattr(query_analysis.complexity, "value", str(getattr(query_analysis, "complexity", ""))),
+        "domain": getattr(query_analysis, "domain", None),
+        "intent_type": getattr(query_analysis, "intent_type", None),
+        "strategy": getattr(retrieval_config.strategy, "value", str(getattr(retrieval_config, "strategy", ""))),
+        "use_rerank": bool(getattr(retrieval_config, "use_rerank", False)),
+        "auto_merge_enabled": auto_merge_enabled,
+        "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+        "rrf_threshold": float(os.getenv("RRF_SCORE_THRESHOLD", "0.022")),
+        "raw_similarity_threshold": float(os.getenv("SIMILARITY_THRESHOLD", "0.65")),
+    }
+
+
+def build_retrieval_judgement(query: str, docs: List[dict], relevant_ids: List[str], k: int | None = None, meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    meta = meta or {}
+    retrieved_ids = [_doc_identifier(doc) for doc in docs]
+    effective_k = int(k or len(retrieved_ids) or 0)
+    return {
+        "query": query,
+        "k": effective_k,
+        "relevant_ids": [str(item) for item in relevant_ids if item is not None],
+        "retrieved_ids": retrieved_ids,
+        "retrieved_count": len(retrieved_ids),
+        "retrieval_mode": meta.get("retrieval_mode"),
+        "multi_query_enabled": bool(meta.get("multi_query_enabled")),
+        "multi_query_variants": list(meta.get("multi_query_variants") or []),
+        "rerank_applied": bool(meta.get("rerank_applied")),
+        "rerank_fallback_used": bool(meta.get("rerank_fallback_used")),
+        "auto_merge_applied": bool(meta.get("auto_merge_applied")),
+    }
+
 
 def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
+    understanding = get_query_understanding_service().analyze_for_retrieval(query)
+    query_analysis = understanding.query_analysis
+    retrieval_config = understanding.retrieval_config
+    top_k = retrieval_config.top_k
+    auto_merge_enabled = retrieval_config.strategy in (
+        RetrievalStrategy.HYBRID,
+        RetrievalStrategy.ADAPTIVE,
+        RetrievalStrategy.MULTI_STAGE,
+    )
+
+    strategy_config = get_performance_config().get_strategy(query_analysis.complexity)
+    cache_enabled = strategy_config.enable_cache and query_analysis.complexity in (QueryComplexity.SIMPLE, QueryComplexity.MEDIUM)
+    cache_key_payload = _build_retrieval_cache_key_payload(query, query_analysis, retrieval_config, top_k, auto_merge_enabled)
+    if cache_enabled:
+        cached_result = _smart_cache.get_retrieval_result_by_key(cache_key_payload)
+        if cached_result is None:
+            cached_result = _smart_cache.get_semantic_retrieval_result_by_key(cache_key_payload)
+            cache_mode = "semantic"
+        else:
+            cache_mode = "structured"
+        if cached_result is not None:
+            cached_meta = dict(cached_result.get("meta") or {})
+            cached_meta["cache_hit"] = True
+            cached_meta["cache_key_mode"] = cache_mode
+            return {
+                "docs": cached_result.get("docs") or [],
+                "meta": cached_meta,
+            }
+
+    # ========== 相似度阈值配置 ==========
+    RRF_THRESHOLD = float(os.getenv("RRF_SCORE_THRESHOLD", "0.022"))
+    RAW_SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.65"))
+    # =====================================
+
     candidate_k = max(top_k * 3, top_k)
     filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
 
-    # 确保Milvus已初始化
     _ensure_milvus_initialized()
 
     try:
-        # 生成HyDE文档
-        hyde_doc = generate_hypothetical_document(query)
+        logger.info(
+            f"🔍 检索开始: 查询复杂度={query_analysis.complexity.value}, "
+            f"扩展所有权=rag_pipeline, rerank_requested={retrieval_config.use_rerank}"
+        )
 
-        # 准备检索查询列表
-        search_queries = [query]
-        if hyde_doc:
-            search_queries.append(hyde_doc)
+        query_variants = [{"variant": "original", "query": query}]
+        if query_analysis.complexity != QueryComplexity.SIMPLE:
+            step_back = step_back_expand(query)
+            if step_back.get("step_back_question") or step_back.get("step_back_answer"):
+                query_variants.append({
+                    "variant": "step_back",
+                    "query": step_back.get("expanded_query") or query,
+                    "step_back_question": step_back.get("step_back_question", ""),
+                    "step_back_answer": step_back.get("step_back_answer", ""),
+                })
+            hyde_doc = generate_hypothetical_document(query)
+            if hyde_doc:
+                query_variants.append({"variant": "hyde", "query": hyde_doc, "hypothetical_doc": hyde_doc})
 
-        all_results = []
+        if query_analysis.complexity in (QueryComplexity.MEDIUM, QueryComplexity.COMPLEX_LIGHT, QueryComplexity.COMPLEX_HEAVY):
+            synonym_query = query
+            if query_analysis.intent_type:
+                synonym_query = f"{query}\n\n同义表达: {query_analysis.intent_type}"
+            query_variants.append({"variant": "synonyms", "query": synonym_query})
 
-        # 对每个查询进行检索
-        for search_query in search_queries:
+        result_sets: List[Dict[str, Any]] = []
+        for variant in query_variants:
+            search_query = variant["query"]
+            variant_name = variant["variant"]
             try:
                 dense_embeddings = _embedding_service.get_embeddings([search_query])
                 dense_embedding = dense_embeddings[0]
                 sparse_embedding = _embedding_service.get_sparse_embedding(search_query)
-
                 retrieved = _milvus_manager.hybrid_retrieve(
                     dense_embedding=dense_embedding,
                     sparse_embedding=sparse_embedding,
-                    top_k=candidate_k // len(search_queries),  # 分配检索数量
+                    top_k=max(1, candidate_k // len(query_variants)),
                     filter_expr=filter_expr,
                 )
-                all_results.extend(retrieved)
+                result_sets.append({"variant": variant_name, "docs": retrieved})
             except Exception as e:
-                error_msg = f"检索查询 '{search_query[:50]}...' 失败: {e}"
-                logger.warning(error_msg)
-                # 尝试仅使用密集向量检索作为降级
+                logger.warning(f"检索查询 '{search_query[:50]}...' 失败: {e}")
                 try:
                     dense_embeddings = _embedding_service.get_embeddings([search_query])
                     dense_embedding = dense_embeddings[0]
                     dense_results = _milvus_manager.dense_retrieve(
                         dense_embedding=dense_embedding,
-                        top_k=candidate_k // len(search_queries),
+                        top_k=max(1, candidate_k // len(query_variants)),
                         filter_expr=filter_expr,
                     )
-                    all_results.extend(dense_results)
+                    result_sets.append({"variant": variant_name, "docs": dense_results})
                     logger.info(f"查询 '{search_query[:50]}...' 降级到密集检索成功")
                 except Exception as e2:
                     logger.error(f"查询 '{search_query[:50]}...' 的降级检索也失败: {e2}")
-                continue
+                    result_sets.append({"variant": variant_name, "docs": []})
 
-        # 去重
+        fused_docs, fusion_meta = _merge_query_results(result_sets, top_k=max(top_k * 2, top_k))
+
         seen = set()
         unique_results = []
-        for result in all_results:
-            key = (result.get("filename"), result.get("page_number"), result.get("text"))
-            if key not in seen:
-                seen.add(key)
-                unique_results.append(result)
+        for result in fused_docs:
+            key = _chunk_key(result)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_results.append(result)
 
-        # 按分数排序
-        unique_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        unique_results.sort(key=lambda x: x.get("fusion_score", x.get("score", 0.0)), reverse=True)
 
-        reranked, rerank_meta = _rerank_documents(query=query, docs=unique_results, top_k=top_k)
-        merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-        rerank_meta["retrieval_mode"] = "hybrid_with_hyde"
+        def filter_by_similarity(docs: List[dict]) -> Tuple[List[dict], Dict[str, Any]]:
+            if not docs:
+                return docs, {"filtered_count": 0, "filter_applied": False}
+
+            score_types = {doc.get("score_type", "raw_similarity") for doc in docs}
+            effective_score_type = "rrf" if "rrf" in score_types else "raw_similarity"
+            threshold = RRF_THRESHOLD if effective_score_type == "rrf" else RAW_SIMILARITY_THRESHOLD
+
+            filtered_docs = [d for d in docs if d.get("fusion_score", d.get("score", 0)) >= threshold]
+            filtered_count = len(docs) - len(filtered_docs)
+
+            logger.info(
+                f"📊 相似度过滤: 原始{len(docs)}个, "
+                f"阈值={threshold:.3f}({effective_score_type}), "
+                f"过滤{filtered_count}个, 保留{len(filtered_docs)}个"
+            )
+
+            return filtered_docs, {
+                "filter_applied": True,
+                "filter_threshold": threshold,
+                "filter_type": effective_score_type,
+                "filter_score_types": sorted(score_types),
+                "original_count": len(docs),
+                "filtered_count": filtered_count,
+                "retained_count": len(filtered_docs)
+            }
+
+        filtered_results, filter_meta = filter_by_similarity(unique_results)
+
+        if not filtered_results:
+            logger.warning("⚠️ 相似度过滤后无文档，知识库可能没有相关内容")
+            result = {
+                "docs": [],
+                "meta": {
+                    "retrieval_mode": "multi_query_fused",
+                    "candidate_k": candidate_k,
+                    "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+                    "no_relevant_docs": True,
+                    "reason": "all_docs_below_similarity_threshold",
+                    "query_expansion_owner": "rag_pipeline",
+                    "hyde_generated_count": sum(1 for item in query_variants if item["variant"] == "hyde"),
+                    "step_back_generated": any(item["variant"] == "step_back" for item in query_variants),
+                    "expanded_retrieval_count": len(query_variants),
+                    **fusion_meta,
+                    **filter_meta,
+                    "rerank_requested": bool(retrieval_config.use_rerank),
+                    "rerank_available": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+                    "rerank_enabled": False,
+                    "rerank_applied": False,
+                    "rerank_skip_reason": "no_relevant_docs_before_rerank",
+                    "auto_merge_enabled": auto_merge_enabled,
+                    "auto_merge_applied": False,
+                }
+            }
+            if cache_enabled:
+                _smart_cache.set_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+                _smart_cache.set_semantic_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+            return result
+
+        reranked, rerank_meta = _rerank_documents(
+            query=query,
+            docs=filtered_results,
+            top_k=top_k,
+            rerank_requested=retrieval_config.use_rerank,
+        )
+        merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k, auto_merge_enabled=auto_merge_enabled)
+
+        rerank_meta["retrieval_mode"] = "multi_query_fused"
         rerank_meta["candidate_k"] = candidate_k
         rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
+        rerank_meta["score_type"] = filter_meta.get("filter_type")
+        rerank_meta["query_expansion_owner"] = "rag_pipeline"
+        rerank_meta["hyde_generated_count"] = sum(1 for item in query_variants if item["variant"] == "hyde")
+        rerank_meta["step_back_generated"] = any(item["variant"] == "step_back" for item in query_variants)
+        rerank_meta["expanded_retrieval_count"] = len(query_variants)
+        rerank_meta["dynamic_strategy"] = {
+            "strategy": retrieval_config.strategy.value,
+            "query_complexity": query_analysis.complexity.value,
+            "domain": query_analysis.domain,
+            "intent_type": query_analysis.intent_type
+        }
+        rerank_meta.update(fusion_meta)
+        rerank_meta.update(filter_meta)
         rerank_meta.update(merge_meta)
-        return {"docs": merged_docs, "meta": rerank_meta}
+        result = {"docs": merged_docs, "meta": rerank_meta}
+        if cache_enabled:
+            _smart_cache.set_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+            _smart_cache.set_semantic_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+        return result
     except Exception as e:
         logger.warning(f"混合检索失败，尝试降级到密集检索: {e}")
         try:
@@ -348,27 +632,56 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
                 top_k=candidate_k,
                 filter_expr=filter_expr,
             )
-            reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
-            merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
+            reranked, rerank_meta = _rerank_documents(
+                query=query,
+                docs=retrieved,
+                top_k=top_k,
+                rerank_requested=retrieval_config.use_rerank,
+            )
+            merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k, auto_merge_enabled=auto_merge_enabled)
             rerank_meta["retrieval_mode"] = "dense_fallback"
             rerank_meta["candidate_k"] = candidate_k
             rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
+            rerank_meta.update({
+                "score_type": "raw_similarity",
+                "query_expansion_owner": "rag_pipeline",
+                "hyde_generated_count": 0,
+                "step_back_generated": False,
+                "expanded_retrieval_count": 1,
+                "dynamic_strategy": {
+                    "strategy": retrieval_config.strategy.value,
+                    "query_complexity": query_analysis.complexity.value,
+                    "domain": query_analysis.domain,
+                    "intent_type": query_analysis.intent_type,
+                },
+            })
             rerank_meta.update(merge_meta)
-            return {"docs": merged_docs, "meta": rerank_meta}
+            result = {"docs": merged_docs, "meta": rerank_meta}
+            if cache_enabled:
+                _smart_cache.set_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+                _smart_cache.set_semantic_retrieval_result_by_key(cache_key_payload, result, ttl=strategy_config.cache_ttl)
+            return result
         except Exception as e2:
             logger.error(f"密集检索也失败: {e2}")
             return {
                 "docs": [],
                 "meta": {
-                    "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+                    "rerank_requested": bool(retrieval_config.use_rerank),
+                    "rerank_available": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+                    "rerank_enabled": bool(retrieval_config.use_rerank and RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
                     "rerank_applied": False,
+                    "rerank_skip_reason": "retrieve_failed",
                     "rerank_model": RERANK_MODEL,
                     "rerank_endpoint": _get_rerank_endpoint(),
                     "rerank_error": "retrieve_failed",
                     "retrieval_mode": "failed",
                     "candidate_k": candidate_k,
                     "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
-                    "auto_merge_enabled": AUTO_MERGE_ENABLED,
+                    "query_expansion_owner": "rag_pipeline",
+                    "hyde_generated_count": 0,
+                    "step_back_generated": False,
+                    "expanded_retrieval_count": 0,
+                    "auto_merge_enabled": auto_merge_enabled,
                     "auto_merge_applied": False,
                     "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
                     "auto_merge_replaced_chunks": 0,
