@@ -49,3 +49,4 @@ Thumbs.db
 # 项目数据/临时
 data/
 temp/
+backend/model/
