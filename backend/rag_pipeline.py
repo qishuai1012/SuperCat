@@ -10,26 +10,35 @@ from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 
+# 配置：性能策略、问题复杂度分析
 from performance_config import get_performance_config
 from query_understanding.complexity import get_complexity_analyzer
+# RAG 模块：检索、查询扩展
 from rag.expansion import generate_hypothetical_document, step_back_expand
 from rag.retriever import retrieve_documents
+# 工具函数：RRF融合、结果评估、文档格式化、追踪日志
 from rag_utils import build_retrieval_judgement, _merge_query_results
 from rag.trace import _format_docs, build_retrieval_trace, merge_rag_trace
+# 前端/日志输出工具
 from tools import emit_rag_step, should_skip_grading
 
+# 日志初始化
 logger = logging.getLogger(__name__)
 load_dotenv()
 
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL", MODEL)  # 使用主模型作为默认值
+GRADE_MODEL = os.getenv("GRADE_MODEL", MODEL)  # 使用主模型作为默认值，# 评分模型（默认=主模型）
 
+# 全局单例模型（避免重复加载，生产级标准）
 _grader_model = None
 _router_model = None
 
-
+# ----------------------
+# 1. 加载 文档评分模型
+# 作用：判断检索回来的文档是否与问题相关
+# ----------------------
 def _get_grader_model():
     global _grader_model
     if not API_KEY or not GRADE_MODEL:
@@ -40,11 +49,14 @@ def _get_grader_model():
             model_provider="openai",
             api_key=API_KEY,
             base_url=BASE_URL,
-            temperature=0,
+            temperature=0,       # 评分必须确定性
         )
     return _grader_model
 
-
+# ----------------------
+# 2. 加载 路由模型
+# 作用：自动选择策略：step_back / hyde / complex
+# ----------------------
 def _get_router_model():
     global _router_model
     if not API_KEY or not MODEL:
@@ -59,7 +71,8 @@ def _get_router_model():
         )
     return _router_model
 
-
+# ====================== 评分 Prompt ======================
+# 作用：让模型判断文档是否相关，输出 yes / no
 GRADE_PROMPT = (
     "You are an expert grader. Your task is to assess whether a retrieved document is relevant to a user question.\n\n"
     "Retrieved document:\n{context}\n\n"
@@ -76,8 +89,9 @@ GRADE_PROMPT = (
     "\n\n"
     "Your output:")
 
-
+# ====================== 结构化输出定义 ======================
 class GradeDocuments(BaseModel):
+    """文档相关性评分：二元判断"""
     """Grade documents using a binary score for relevance check."""
 
     binary_score: str = Field(
@@ -86,32 +100,42 @@ class GradeDocuments(BaseModel):
 
 
 class RewriteStrategy(BaseModel):
+    """查询重写策略"""
     """Choose a query expansion strategy."""
 
     strategy: Literal["step_back", "hyde", "complex"]
 
-
+# ====================== RAG 状态管理 ======================
+# 整个工作流共享的状态（LangGraph 必须）
 class RAGState(TypedDict):
-    question: str
-    query: str
-    context: str
-    docs: List[dict]
-    route: Optional[str]
-    expansion_type: Optional[str]
-    expanded_query: Optional[str]
+    question: str                      # 用户原始问题
+    query: str                        # 当前查询语句
+    context: str                      # 文档拼接后的内容
+    docs: List[dict]                  # 检索到的文档
+    route: Optional[str]              # 路由：generate_answer / rewrite_question
+    expansion_type: Optional[str]     # 扩展类型：step_back/hyde/complex
+    expanded_query: Optional[str]     # 扩展后的查询
     step_back_question: Optional[str]
     step_back_answer: Optional[str]
-    hypothetical_doc: Optional[str]
-    skip_grading: Optional[bool]
-    rag_trace: Optional[dict]
+    hypothetical_doc: Optional[str]   # HyDE 生成的假设文档
+    skip_grading: Optional[bool]      # 是否跳过评分
+    rag_trace: Optional[dict]         # 完整追踪日志
 
-
+# ====================== 策略决策（根据问题复杂度） ======================
 def _get_strategy_config_for_question(question: str):
+    """
+    根据问题复杂度（简单/中等/复杂）自动选择检索策略
+    生产级：动态调整，简单问题不浪费性能
+    """
     complexity = get_complexity_analyzer().analyze(question)
     return get_performance_config().get_strategy(complexity), complexity
 
-
+# ====================== 评分决策 ======================
 def _decide_grading(question: str, docs: List[dict], skip_grading_signal: bool, retrieval_trace: dict | None = None) -> dict:
+    """
+    生产级核心逻辑：
+    判断是否需要运行文档评分，避免不必要调用模型
+    """
     retrieval_trace = retrieval_trace or {}
     strategy_config, complexity = _get_strategy_config_for_question(question)
     docs_count = len(docs)
@@ -127,21 +151,25 @@ def _decide_grading(question: str, docs: List[dict], skip_grading_signal: bool, 
         "grade_min_docs_for_skip": strategy_config.min_docs_for_skip_grading,
     }
 
+    # 无文档 → 不评分
     if docs_count == 0:
         decision["grade_should_run"] = False
         decision["grade_skip_reason"] = "no_docs"
         return decision
 
+     # 配置关闭评分 → 不评分
     if not strategy_config.enable_document_grading:
         decision["grade_should_run"] = False
         decision["grade_skip_reason"] = "config_disabled"
         return decision
 
+    # 检索器返回无相关文档 → 不评分
     if retrieval_trace.get("no_relevant_docs"):
         decision["grade_should_run"] = False
         decision["grade_skip_reason"] = "retrieval_reported_no_relevant_docs"
         return decision
 
+    # 启发式跳过：问题简单+文档足够 → 不评分
     if skip_grading_signal and docs_count >= strategy_config.min_docs_for_skip_grading:
         decision["grade_should_run"] = False
         decision["grade_skip_reason"] = "heuristic_skip_with_enough_docs"
@@ -149,8 +177,12 @@ def _decide_grading(question: str, docs: List[dict], skip_grading_signal: bool, 
 
     return decision
 
-
+# ====================== 解析评分模型输出 ======================
 def _parse_grade_response(raw_content: str) -> tuple[str, str]:
+    """
+    解析模型返回的 JSON / 纯文本，兼容各种输出格式
+    生产级：鲁棒性极强
+    """
     text = (raw_content or "").strip()
     if not text:
         raise ValueError("empty grader response")
@@ -162,7 +194,8 @@ def _parse_grade_response(raw_content: str) -> tuple[str, str]:
             return score, "json"
     except Exception:
         pass
-
+    
+    # 2. 正则提取 JSON
     json_match = re.search(r"\{[\s\S]*?\}", text)
     if json_match:
         payload = json.loads(json_match.group())
@@ -170,6 +203,7 @@ def _parse_grade_response(raw_content: str) -> tuple[str, str]:
         if score in ("yes", "no"):
             return score, "json_extract"
 
+     # 3. 纯文本匹配
     normalized = text.lower()
     if normalized in ("yes", '"yes"', "'yes'"):
         return "yes", "literal"
@@ -178,12 +212,17 @@ def _parse_grade_response(raw_content: str) -> tuple[str, str]:
 
     raise ValueError(f"unrecognized grader response: {text[:80]}")
 
-
+# ====================== 节点 1：初次检索 ======================
 def retrieve_initial(state: RAGState) -> RAGState:
+    """
+    第一次检索：直接用用户原始问题检索
+    """
     query = state["question"]
     logger.info(f"🔵 retrieve_initial节点开始执行")
     emit_rag_step("🔍", "正在检索知识库...", f"查询: {query[:50]}")
     started_at = time.perf_counter()
+
+    # 调用检索工具
     retrieved = retrieve_documents(query, top_k=5)
     duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
     logger.info(f"🔵 retrieve_initial节点执行完成")
@@ -225,13 +264,20 @@ def retrieve_initial(state: RAGState) -> RAGState:
         "rag_trace": rag_trace,
     }
 
-
+# ====================== 节点 2：文档评分（Self-RAG 核心） ======================
 def grade_documents_node(state: RAGState) -> RAGState:
+    """
+    让模型判断：检索到的文档是否足够回答问题
+    yes → 生成答案
+    no → 重写查询 + 多路检索
+    """
     started_at = time.perf_counter()
     docs = state.get("docs") or []
     question = state["question"]
     skip_grading_signal = bool(state.get("skip_grading") or should_skip_grading(question))
     rag_trace = state.get("rag_trace", {}) or {}
+
+    # 判断是否需要评分
     decision = _decide_grading(
         question=question,
         docs=docs,
@@ -251,6 +297,7 @@ def grade_documents_node(state: RAGState) -> RAGState:
         "grading_duration_ms": None,
     }
 
+    # 无文档 → 直接结束
     if not docs:
         logger.info("No documents retrieved; returning KB no-result route without grading or rewrite")
         rag_trace = merge_rag_trace(
@@ -266,6 +313,7 @@ def grade_documents_node(state: RAGState) -> RAGState:
         emit_rag_step("⚠️", "未检索到相关文档", "直接返回知识库无结果")
         return {"route": "generate_answer", "rag_trace": rag_trace}
 
+    # 配置跳过评分 → 直接生成答案
     if not decision["grade_should_run"]:
         logger.info(f"Skipping document grading: {decision['grade_skip_reason']}")
         rag_trace = merge_rag_trace(
@@ -281,12 +329,14 @@ def grade_documents_node(state: RAGState) -> RAGState:
         emit_rag_step("⚡", "跳过文档评分", f"原因: {decision['grade_skip_reason']}")
         return {"route": "generate_answer", "rag_trace": rag_trace}
 
+    # 获取评分模型
     grader = _get_grader_model()
     logger.info(
         f"Grader model: {GRADE_MODEL}, API key present: {bool(API_KEY)}, "
         f"skip_signal={skip_grading_signal}, complexity={decision['grade_complexity']}"
     )
 
+     # 模型不可用 → 重写查询
     if not grader:
         rag_trace = merge_rag_trace(
             rag_trace,
@@ -303,12 +353,14 @@ def grade_documents_node(state: RAGState) -> RAGState:
             kb_no_result=False,
         )
         return {"route": "rewrite_question", "rag_trace": rag_trace}
-
+    
+    # 执行评分
     context = state.get("context", "")
     prompt = GRADE_PROMPT.format(question=question, context=context)
     score = "no"
     parser_mode = "fallback_no"
 
+    # 结构化输出优先
     try:
         response = grader.with_structured_output(GradeDocuments).invoke(
             [{"role": "user", "content": prompt}]
@@ -323,6 +375,7 @@ def grade_documents_node(state: RAGState) -> RAGState:
             else:
                 raise ValueError(f"unexpected structured score: {raw_score}")
     except Exception:
+        # 兼容普通文本输出
         try:
             raw_response = grader.invoke([{"role": "user", "content": prompt}])
             content = str(raw_response.content if hasattr(raw_response, "content") else raw_response)
@@ -331,12 +384,14 @@ def grade_documents_node(state: RAGState) -> RAGState:
             score = "no"
             parser_mode = "fallback_no"
 
+     # 决策路由
     route = "generate_answer" if score == "yes" else "rewrite_question"
     if route == "generate_answer":
         emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
     else:
         emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {score}")
-
+    
+    # 记录追踪日志
     rag_trace = merge_rag_trace(
         rag_trace,
         **{
@@ -353,8 +408,13 @@ def grade_documents_node(state: RAGState) -> RAGState:
     )
     return {"route": route, "rag_trace": rag_trace}
 
-
+# ====================== 节点 3：查询重写（智能路由） ======================
 def rewrite_question_node(state: RAGState) -> RAGState:
+    """
+    智能选择查询扩展策略：
+    step_back / hyde / complex
+    复杂问题自动两路都执行
+    """
     started_at = time.perf_counter()
     question = state["question"]
     emit_rag_step("✏️", "正在重写查询...")
@@ -370,6 +430,7 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         elif rag_trace.get("legacy_route_strategy"):
             source = "legacy_route"
 
+    # 路由模型选择最优策略
     if not strategy and router:
         prompt = (
             "请根据用户问题选择最合适的查询扩展策略，仅输出策略名。\n"
@@ -397,6 +458,7 @@ def rewrite_question_node(state: RAGState) -> RAGState:
     step_back_answer = ""
     hypothetical_doc = ""
 
+    # step_back 策略：抽象问题，扩大召回
     if strategy in ("step_back", "complex"):
         emit_rag_step("🧠", f"使用策略: {strategy}", "生成退步问题")
         step_back = step_back_expand(question)
@@ -404,10 +466,12 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         step_back_answer = step_back.get("step_back_answer", "")
         expanded_query = step_back.get("expanded_query", question)
 
+    # hyde 策略：生成假设答案再检索   
     if strategy in ("hyde", "complex"):
         emit_rag_step("📝", "HyDE 假设性文档生成中...")
         hypothetical_doc = generate_hypothetical_document(question)
-
+    
+    # 记录日志
     rag_trace = merge_rag_trace(
         rag_trace,
         rewrite_strategy=strategy,
@@ -429,8 +493,15 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         "rag_trace": rag_trace,
     }
 
-
+# ====================== 节点 4：扩展检索（多路检索 + RRF 融合） ======================
 def retrieve_expanded(state: RAGState) -> RAGState:
+    """
+    多路检索核心：
+    1. hyde 检索一路
+    2. step_back 检索一路
+    3. RRF 融合排序
+    4. 返回最终文档
+    """
     started_at = time.perf_counter()
     strategy = state.get("expansion_type") or "step_back"
     emit_rag_step("🔄", "使用扩展查询重新检索...", f"策略: {strategy}")
@@ -453,6 +524,9 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     auto_merge_replaced_chunks = 0
     auto_merge_steps = 0
 
+    # ----------------------
+    # 多路 1：HyDE 检索
+    # ----------------------
     if strategy in ("hyde", "complex"):
         hypothetical_doc = state.get("hypothetical_doc") or generate_hypothetical_document(state["question"])
         retrieved_hyde = retrieve_documents(hypothetical_doc, top_k=5)
@@ -486,6 +560,9 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(hyde_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(hyde_meta.get("auto_merge_steps") or 0)
 
+    # ----------------------
+    # 多路 2：StepBack 检索
+    # ----------------------
     if strategy in ("step_back", "complex", "direct"):
         expanded_query = state.get("expanded_query") or state["question"]
         retrieved_stepback = retrieve_documents(expanded_query, top_k=5)
@@ -519,6 +596,9 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(step_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(step_meta.get("auto_merge_steps") or 0)
 
+    # ----------------------
+    # RRF 多路结果融合
+    # ----------------------
     fused_docs, fusion_meta = _merge_query_results(result_sets, top_k=max(5, len(result_sets) * 5)) if result_sets else ([], {"multi_query_enabled": False, "multi_query_variants": [], "multi_query_docs_total": 0, "multi_query_docs_unique": 0, "multi_query_docs_returned": 0, "multi_query_hits": {}})
 
     context = _format_docs(fused_docs)
@@ -567,7 +647,7 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     )
     return {"docs": fused_docs, "context": context, "rag_trace": rag_trace}
 
-
+# ====================== 构建 RAG 工作流（LangGraph） ======================
 def build_rag_graph():
     # 创建一个状态图，数据格式遵循 RAGState
     graph = StateGraph(RAGState)
@@ -607,7 +687,7 @@ def build_rag_graph():
 # 最终生成一个可调用的 RAG 图
 rag_graph = build_rag_graph()
 
-
+#执行完整的 RAG 工作流，返回最终文档
 def run_rag_graph(question: str, skip_grading: bool = False, expansion_hint: str | None = None) -> dict:
     legacy_strategy = None
     if question.startswith("[ROUTE:"):
@@ -618,25 +698,26 @@ def run_rag_graph(question: str, skip_grading: bool = False, expansion_hint: str
 
     strategy = expansion_hint or legacy_strategy
 
+    #调用 LangGraph 执行完整 RAG 流程
     return rag_graph.invoke({
-        "question": question,
-        "query": question,
-        "context": "",
-        "docs": [],
-        "route": None,
-        "expansion_type": strategy,
+        "question": question,            # 用户问题
+        "query": question,               # 当前查询
+        "context": "",                   # 文档内容（一开始为空）
+        "docs": [],                     # 检索到的文档（一开始为空）
+        "route": None,                  # 路由（一开始为空）
+        "expansion_type": strategy,     # 策略
         "expanded_query": None,
         "step_back_question": None,
-        "step_back_answer": None,
+        "step_back_answer": None,   
         "hypothetical_doc": None,
-        "skip_grading": skip_grading,
-        "rag_trace": {
+        "skip_grading": skip_grading,   # 是否跳过评分
+        "rag_trace": {                  # 追踪日志
             "route_expansion_hint": expansion_hint,
             "legacy_route_strategy": legacy_strategy,
         },
     })
 
-
+#测试 RAG 效果好不好，打分、评估准确率
 def evaluate_rag_retrieval(question: str, relevant_ids: List[str], *, k: int | None = None, skip_grading: bool = False, expansion_hint: str | None = None) -> dict:
     from learning_system import get_online_learning_system
 

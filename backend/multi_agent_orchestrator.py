@@ -462,6 +462,11 @@ class SpecializedAgent:
 
     async def _run_agent(self, task: AgentTask) -> Dict[str, Any]:
         """内部执行Agent逻辑，原样保留原有调用格式"""
+        try:
+            from tools import reset_tool_call_guards
+            reset_tool_call_guards()
+        except Exception:
+            pass
         input_message = self._prepare_input(task.input_data)
         logger.info(f"Agent {self.agent_type.value} 开始调用模型，输入长度: {len(input_message)} 字符")
         model_start = asyncio.get_event_loop().time()
@@ -1061,9 +1066,18 @@ class MultiAgentOrchestrator:
             )
 
     async def _execute_complex_light_strategy(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """执行轻度复杂策略（跳过Planning，并行执行Analysis和Synthesis）"""
+        """执行轻度复杂策略（跳过Planning，先检索再并行Analysis/Synthesis）"""
         try:
-            logger.info("🚀 并行执行 Analysis 和 Synthesis（无Planning）")
+            # 先检索知识库
+            retrieval_task = AgentTask(
+                id="retrieval_complex_light",
+                agent_type=AgentType.RETRIEVAL,
+                input_data={"query": query, "context": context},
+                timeout=120.0
+            )
+            retrieval_result = await self.agents[AgentType.RETRIEVAL].execute(retrieval_task)
+            retrieval_dict = self._result_to_dict(retrieval_result)
+            logger.info("🚀 检索完成，并行执行 Analysis 和 Synthesis")
 
             # 创建分析任务
             analysis_task = AgentTask(
@@ -1072,6 +1086,7 @@ class MultiAgentOrchestrator:
                 input_data={
                     "query": query,
                     "context": context,
+                    "retrieval_result": retrieval_dict,
                     "requirements": "分析查询内容和需求"
                 },
                 timeout=120.0
@@ -1084,6 +1099,7 @@ class MultiAgentOrchestrator:
                 input_data={
                     "original_query": query,
                     "context": context,
+                    "retrieval_result": retrieval_dict,
                     "requirements": "准备综合框架"
                 },
                 timeout=120.0

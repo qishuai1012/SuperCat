@@ -27,9 +27,12 @@ class QueryContextBuilder:
         history_data = [{"type": getattr(m, "type", "unknown"), "content": str(m.content)} for m in history]
 
         from query_understanding.service import get_query_understanding_service
+        from rag_utils import rewrite_with_context
+
+        resolved_text = rewrite_with_context(user_text, history_data) if history_data else user_text
 
         understanding = get_query_understanding_service(router=self.router).analyze_for_chat(
-            user_text=user_text,
+            user_text=resolved_text,
             user_id=user_id,
             session_id=session_id,
             history=history_data,
@@ -42,7 +45,7 @@ class QueryContextBuilder:
             build_step.finish()
 
         return QueryContext(
-            user_text=user_text,
+            user_text=resolved_text,
             user_id=user_id,
             session_id=session_id,
             history=history_data,

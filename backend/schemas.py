@@ -1,36 +1,47 @@
+# 定义前后端交互的所有数据格式（接口的 “语法手册”）
 from pydantic import BaseModel
 from typing import Optional, List, Any
 
-#用户登录 / 注册相关
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    role: Optional[str] = "user"
-    admin_code: Optional[str] = None
 
-#登录接口接收的数据
+# ==============================
+# 1. 用户认证相关（登录/注册）
+# ==============================
+
+# 注册请求体
+class RegisterRequest(BaseModel):
+    username: str                # 用户名
+    password: str                # 密码
+    role: Optional[str] = "user" # 角色：默认普通用户
+    admin_code: Optional[str] = None # 管理员邀请码（可选）
+
+# 登录请求体
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-#登录成功返回的数据
+# 登录/注册成功返回
 class AuthResponse(BaseModel):
-    access_token: str
+    access_token: str       # JWT 身份令牌
     token_type: str = "bearer"
-    username: str
-    role: str
+    username: str           # 用户名
+    role: str               # 角色
 
-#获取当前登录用户信息
+# 获取当前登录用户信息
 class CurrentUserResponse(BaseModel):
     username: str
     role: str
 
-# 前端发消息给后端的数据格式
+
+# ==============================
+# 2. 聊天接口数据格式
+# ==============================
+
+# 前端 → 后端：发消息
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default_session"
 
-#检索到的文档片段格式
+# 检索到的文档块信息
 class RetrievedChunk(BaseModel):
     filename: str
     page_number: Optional[str | int] = None
@@ -40,79 +51,90 @@ class RetrievedChunk(BaseModel):
     rerank_score: Optional[float] = None
 
 
+# ------------------------------
+# 以下是 RAG 内部追踪格式（高级调试用）
+# ------------------------------
+# ============================
+# 以下所有类 👉 仅供 AI 内部使用
+# 不属于接口，不给前端用
+# 作用：记录 AI 的思考、推理、上下文、任务
+# ============================
+
+# 知识点结构：AI 从文档里提取的核心知识点（结构化记忆）
 class KnowledgePoint(BaseModel):
-    concept: str
-    definition: str
-    importance: Optional[int] = None
-    category: Optional[str] = None
+    concept: str                          # 知识点名称（如：向量数据库）
+    definition: str                       # 知识点定义/解释
+    importance: Optional[int] = None      # 重要程度（1-5）
+    category: Optional[str] = None        # 分类（如：RAG、数据库、编程）
 
-
+# 消息摘要：用于压缩聊天历史，只保留简短关键信息
 class MessageDigest(BaseModel):
-    type: str
-    content_preview: str
+    type: str                             # 消息类型：user / assistant
+    content_preview: str                  # 消息内容摘要（精简版）
 
-
+# 上下文压缩元数据：记录 AI 如何压缩长对话
 class CompressionMetadata(BaseModel):
-    strategy: str
-    raw_chars: int = 0
-    compact_chars: int = 0
-    compression_ratio: float = 1.0
-    dropped_fields: List[str] = []
-    history_messages_total: Optional[int] = None
-    history_messages_retained: Optional[int] = None
-    trace_chunks_total: Optional[int] = None
-    trace_chunks_retained: Optional[int] = None
+    strategy: str                         # 压缩策略名称
+    raw_chars: int = 0                    # 原始字符数
+    compact_chars: int = 0                # 压缩后字符数
+    compression_ratio: float = 1.0        # 压缩比例
+    dropped_fields: List[str] = []        # 压缩时丢弃了哪些字段
+    history_messages_total: Optional[int] = None    # 总历史消息数
+    history_messages_retained: Optional[int] = None # 保留的消息数
+    trace_chunks_total: Optional[int] = None        # 总文档块数
+    trace_chunks_retained: Optional[int] = None     # 保留的文档块数
 
-
+# 精简追踪信息：AI 执行过程的轻量记录
 class CompactTrace(BaseModel):
-    tool_used: Optional[bool] = None
-    tool_name: Optional[str] = None
-    query: Optional[str] = None
-    retrieval_stage: Optional[str] = None
-    evidence_chunks: Optional[List[RetrievedChunk]] = None
-    reason: Optional[str] = None
-    filter_summary: Optional[dict] = None
+    tool_used: Optional[bool] = None              # 是否使用了 RAG 工具
+    tool_name: Optional[str] = None                # 工具名称
+    query: Optional[str] = None                    # 用户的问题
+    retrieval_stage: Optional[str] = None          # 检索阶段
+    evidence_chunks: Optional[List[RetrievedChunk]] = None  # 参考的文档片段
+    reason: Optional[str] = None                   # 选择这些文档的原因
+    filter_summary: Optional[dict] = None          # 过滤规则的总结
 
-
+# 上下文包：给大模型提供的所有上下文（问题+历史+知识点）
 class ContextBundle(BaseModel):
-    query: str
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None
-    history_summary: str = ""
-    recent_messages: List[MessageDigest] = []
-    key_knowledge: List[KnowledgePoint] = []
-    compression_meta: Optional[CompressionMetadata] = None
+    query: str                                     # 用户当前问题
+    user_id: Optional[str] = None                  # 用户ID
+    session_id: Optional[str] = None               # 会话ID
+    history_summary: str = ""                      # 历史对话总结
+    recent_messages: List[MessageDigest] = []      # 最近的精简消息
+    key_knowledge: List[KnowledgePoint] = []       # 提取的关键知识点
+    compression_meta: Optional[CompressionMetadata] = None  # 压缩信息
 
-
+# 子任务结果总结：多智能体系统中，每个子任务的执行结果
 class SubtaskResultSummary(BaseModel):
-    task_id: str
-    agent_type: str
-    success: bool
-    summary: str
-    key_points: List[KnowledgePoint] = []
-    evidence: List[RetrievedChunk] = []
-    issues: List[str] = []
-    confidence: Optional[float] = None
-    compact_trace: Optional[CompactTrace] = None
-    execution_time: Optional[float] = None
+    task_id: str                                   # 子任务ID
+    agent_type: str                                # 执行任务的智能体类型
+    success: bool                                  # 是否成功
+    summary: str                                   # 任务结果总结
+    key_points: List[KnowledgePoint] = []          # 任务提取的知识点
+    evidence: List[RetrievedChunk] = []            # 任务使用的证据文档
+    issues: List[str] = []                         # 遇到的问题
+    confidence: Optional[float] = None             # 置信度
+    compact_trace: Optional[CompactTrace] = None   # 执行过程追踪
+    execution_time: Optional[float] = None         # 执行耗时
 
-
+# 规划总结：AI 回答问题前的“作战计划”
 class PlanningSummary(BaseModel):
-    goal: str
-    strategy: Optional[str] = None
-    subtasks: List[dict] = []
-    risks: List[str] = []
-    checks: List[str] = []
+    goal: str                                      # 最终目标
+    strategy: Optional[str] = None                 # 整体策略
+    subtasks: List[dict] = []                      # 拆分成的子任务列表
+    risks: List[str] = []                          # 识别到的风险
+    checks: List[str] = []                         # 校验步骤
 
-
+# 验证总结：AI 回答后的自我校验（防幻觉、纠错）
 class VerificationSummary(BaseModel):
-    verdict: str
-    issues_found: List[str] = []
-    supported_claims: List[str] = []
-    unsupported_claims: List[str] = []
-    recommended_changes: List[str] = []
+    verdict: str                                   # 最终判定：正确/错误/需修改
+    issues_found: List[str] = []                   # 发现的问题
+    supported_claims: List[str] = []               # 有文档支持的内容
+    unsupported_claims: List[str] = []             # 无依据的内容（幻觉）
+    recommended_changes: List[str] = []            # 建议修改的内容
 
-#这就是 RAG 执行全过程的记录！
+
+# RAG 完整追踪日志（超级详细）
 class RagTrace(BaseModel):
     tool_used: bool
     tool_name: str
@@ -195,38 +217,49 @@ class RagTrace(BaseModel):
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None
 
-#后端返回给前端的数据
+
+# 后端 → 前端：聊天回复
 class ChatResponse(BaseModel):
-    response: str
-    rag_trace: Optional[RagTrace] = None
+    response: str               # AI 回答内容
+    rag_trace: Optional[RagTrace] = None # RAG 追踪信息（可选）
 
-#单条消息的格式
+
+# ==============================
+# 3. 会话（聊天历史）格式
+# ==============================
+
+# 单条消息
 class MessageInfo(BaseModel):
-    type: str
-    content: str
-    timestamp: str
+    type: str          # user / assistant
+    content: str       # 内容
+    timestamp: str     # 时间
     rag_trace: Optional[RagTrace] = None
 
-#获取某个会话的所有历史消息
+# 会话的全部消息
 class SessionMessagesResponse(BaseModel):
     messages: List[MessageInfo]
 
-#单个会话信息
+# 单个会话信息
 class SessionInfo(BaseModel):
     session_id: str
     updated_at: str
     message_count: int
 
-#获取用户所有会话列表
+# 会话列表
 class SessionListResponse(BaseModel):
     sessions: List[SessionInfo]
 
-#删除会话后返回
+# 删除会话返回
 class SessionDeleteResponse(BaseModel):
     session_id: str
     message: str
 
-#知识库文件信息
+
+# ==============================
+# 4. 知识库文档管理格式
+# ==============================
+
+# 文档信息
 class DocumentInfo(BaseModel):
     filename: str
     file_type: str
@@ -234,18 +267,18 @@ class DocumentInfo(BaseModel):
     file_md5: Optional[str] = None
     uploaded_at: Optional[str] = None
 
-#￥返回知识库所有文件列表
+# 文档列表
 class DocumentListResponse(BaseModel):
     documents: List[DocumentInfo]
 
-#文件上传成功返回
+# 上传文档返回
 class DocumentUploadResponse(BaseModel):
     filename: str
     chunks_processed: int
     message: str
     file_md5: Optional[str] = None
 
-#删除文件成功返回
+# 删除文档返回
 class DocumentDeleteResponse(BaseModel):
     filename: str
     chunks_deleted: int

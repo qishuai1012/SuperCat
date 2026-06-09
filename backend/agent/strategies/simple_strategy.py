@@ -26,8 +26,7 @@ class SimpleQueryStrategy(ExecutionStrategy):
         if value is None:
             return False
         if isinstance(value, str):
-            text = value.strip()
-            return text.startswith(f"{KB_NO_RESULT_SENTINEL}:") or KB_NO_RESULT_MESSAGE in text
+            return value.strip().startswith(f"{KB_NO_RESULT_SENTINEL}:")
         if isinstance(value, list):
             return any(self._contains_kb_no_result_signal(item) for item in value)
         if isinstance(value, dict):

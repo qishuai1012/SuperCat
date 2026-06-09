@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 from query_understanding.types import QueryComplexity
 
 try:
+    # sentence_transformers 是一个专门做文本语义理解的 Python 库
     from sentence_transformers import SentenceTransformer
     MODEL_AVAILABLE = True
 except ImportError:
@@ -49,10 +50,10 @@ class ComplexityAnalyzer:
 
         # 4 类标准意图（语义判断基准）
         self.standard_questions = {
-            "SIMPLE": ["什么是RAG", "介绍一下Python", "今天天气如何"],
-            "MEDIUM": ["查询用户列表", "查看系统状态", "获取最新数据"],
-            "COMPLEX_LIGHT": ["对比两种方案区别", "解释原理", "分析优缺点"],
-            "COMPLEX_HEAVY": ["设计系统架构", "技术选型与权衡", "详细分析实现方案"]
+            "SIMPLE": ["什么是RAG", "介绍一下Python", "这篇文章讲的是什么", "这个文档说了什么", "是什么内容", "知识库里有这个吗"],
+            "MEDIUM": ["查询用户列表", "查看系统状态", "获取最新数据", "怎么安装", "如何配置"],
+            "COMPLEX_LIGHT": ["对比两种方案区别", "解释原理", "分析优缺点", "为什么会这样"],
+            "COMPLEX_HEAVY": ["设计系统架构", "技术选型与权衡", "详细分析实现方案", "从多个角度深入比较"]
         }
 
     def _get_embedding(self, text: str):
@@ -126,5 +127,8 @@ _analyzer: Optional[ComplexityAnalyzer] = None
 def get_complexity_analyzer(model_path: str = None):
     global _analyzer
     if _analyzer is None:
+        if model_path is None:
+            import os
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "m3e-base")
         _analyzer = ComplexityAnalyzer(model_path)
     return _analyzer

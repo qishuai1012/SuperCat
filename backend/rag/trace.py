@@ -12,15 +12,14 @@ def _format_docs(docs: List[dict]) -> str:
         chunks.append(f"[{i}] {source} (Page {page}):\n{text}")
     return "\n\n---\n\n".join(chunks)
 
-
-
+# ====================== 合并跟踪 ======================
 def merge_rag_trace(trace: dict | None = None, **updates: Any) -> dict:
     merged = dict(trace or {})
     merged.update(updates)
     return merged
 
 
-
+# ====================== 构建检索跟踪 ======================
 def build_retrieval_trace(
     query: str,
     docs: List[dict],

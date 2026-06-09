@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import logging
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 import threading
 
@@ -151,8 +151,6 @@ class AdaptiveTuner:
         # 当前优化状态
         self.is_optimizing = False
         self.current_experiment = None
-        self.last_applied_at = None
-        self.min_optimization_interval = timedelta(minutes=30)
 
         # 初始化实际调优方法
         self._setup_optimization_methods()
@@ -620,76 +618,6 @@ class AdaptiveTuner:
 
         return recommendations
 
-    def should_run_optimization(self) -> bool:
-        with self._lock:
-            if self.is_optimizing:
-                return False
-            if self.last_applied_at and datetime.now() - self.last_applied_at < self.min_optimization_interval:
-                return False
-        try:
-            performance_analysis = self.learning_system.analyze_performance_trends()
-            return performance_analysis.get("total_queries", 0) >= 5
-        except Exception as e:
-            logger.warning(f"检查调优触发条件失败: {e}")
-            return False
-
-    async def optimize_if_needed(self) -> Dict[str, Any]:
-        if not self.should_run_optimization():
-            return {"status": "skipped"}
-
-        results = await self.run_parameter_optimization()
-        if not results:
-            return {"status": "no_changes"}
-
-        applied = self._apply_runtime_optimizations(results)
-        with self._lock:
-            self.last_applied_at = datetime.now()
-
-        return {
-            "status": "applied" if applied else "evaluated",
-            "applied_count": len(applied),
-            "applied_parameters": [item["parameter"] for item in applied],
-        }
-
-    def _apply_runtime_optimizations(self, optimization_results: List[OptimizationResult]) -> List[Dict[str, Any]]:
-        if not optimization_results:
-            return []
-
-        from dynamic_retrieval_strategy import get_dynamic_retrieval_strategy
-
-        strategy_manager = get_dynamic_retrieval_strategy()
-        applied = []
-        for result in optimization_results:
-            if result.improvement <= 0.05 or result.confidence <= 0.6:
-                continue
-            parameter = result.parameter
-            if parameter == TuningParameter.RETRIEVAL_TOP_K:
-                strategy_manager.set_runtime_override("top_k", int(result.new_value))
-            elif parameter == TuningParameter.RETRIEVAL_THRESHOLD:
-                strategy_manager.set_runtime_override("threshold", float(result.new_value))
-            elif parameter == TuningParameter.RERANK_ENABLED:
-                strategy_manager.set_runtime_override("use_rerank", bool(round(result.new_value)))
-            elif parameter == TuningParameter.HYBRID_WEIGHT_DENSE:
-                strategy_manager.set_runtime_override("hybrid_weights", {
-                    "dense": float(result.new_value),
-                    "sparse": round(1.0 - float(result.new_value), 2),
-                })
-            elif parameter == TuningParameter.HYBRID_WEIGHT_SPARSE:
-                strategy_manager.set_runtime_override("hybrid_weights", {
-                    "dense": round(1.0 - float(result.new_value), 2),
-                    "sparse": float(result.new_value),
-                })
-            else:
-                continue
-
-            applied.append({
-                "parameter": parameter.value,
-                "new_value": result.new_value,
-                "improvement": result.improvement,
-                "confidence": result.confidence,
-            })
-        return applied
-
     def _setup_optimization_methods(self):
         """设置实际调优方法的映射"""
         self._optimization_methods = {
@@ -701,13 +629,13 @@ class AdaptiveTuner:
 
     def _adjust_retrieval_top_k(self, adjustment: int):
         """调整检索数量"""
-        from .rag_utils import LEAF_RETRIEVE_LEVEL
+        from rag_utils import LEAF_RETRIEVE_LEVEL
         # 这里应该调用实际的检索组件
         logger.info(f"调整检索数量: top_k += {adjustment}")
 
     def _adjust_retrieval_threshold(self, adjustment: float):
         """调整检索阈值"""
-        from .rag_utils import AUTO_MERGE_THRESHOLD
+        from rag_utils import AUTO_MERGE_THRESHOLD
         # 这里应该调用实际的检索组件
         logger.info(f"调整检索阈值: threshold += {adjustment}")
 
@@ -765,14 +693,20 @@ class AdaptiveTuner:
             logger.error(f"应用紧急优化失败: {e}")
             return {"status": "error", "message": str(e)}
 
+    async def optimize_if_needed(self):
+        """检查性能瓶颈，必要时自动调优"""
+        try:
+            bottlenecks = self.analyze_performance_bottlenecks()
+            if bottlenecks:
+                self.generate_optimization_strategy(bottlenecks)
+        except Exception as e:
+            logger.warning(f"自适应调优跳过: {e}")
+
 
 _adaptive_tuner = None
-_adaptive_tuner_lock = threading.Lock()
-
 
 def get_adaptive_tuner() -> AdaptiveTuner:
     global _adaptive_tuner
-    with _adaptive_tuner_lock:
-        if _adaptive_tuner is None:
-            _adaptive_tuner = AdaptiveTuner()
+    if _adaptive_tuner is None:
+        _adaptive_tuner = AdaptiveTuner()
     return _adaptive_tuner

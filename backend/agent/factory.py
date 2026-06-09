@@ -53,9 +53,12 @@ class AgentFactory:
                 "Use calculator when users ask math calculation questions. "
                 "Use get_current_weather when users ask about weather. "
                 "Do not call the same tool repeatedly in one turn. "
-                "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer. "
-                f"If the tool output starts with '{KB_NO_RESULT_SENTINEL}:', reply with exactly this sentence and nothing else: {KB_NO_RESULT_MESSAGE} "
-                "When the knowledge base has no relevant information, do not answer from your own knowledge, do not guess, and do not call additional tools."
+                "Once you call search_knowledge_base and receive its result, you MUST use those retrieved chunks to answer. "
+                "Always cite the source filename from the retrieved chunks in your answer (e.g., '根据《文件名》...'). "
+                "Never say the knowledge base has no results if the tool returned 'Retrieved Chunks:' — that means results were found. "
+                "Only if the tool output explicitly says no results were found should you inform the user. "
+                "If the user is asking about your own previous behavior (e.g., '你检索了吗', '你刚才做了什么', '你用了什么工具'), "
+                "answer directly from the conversation history. Do NOT call any tools for such meta-questions."
             ),
         )
 

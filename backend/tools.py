@@ -115,6 +115,11 @@ AMAP_API_KEY = os.getenv("AMAP_API_KEY")
 
 _RAG_STEP_QUEUE: ContextVar = ContextVar('rag_step_queue', default=None)
 _RAG_STEP_LOOP: ContextVar = ContextVar('rag_step_loop', default=None)
+_CURRENT_TASK: ContextVar = ContextVar('current_task', default=None)
+
+# 按 task id 存储 (queue, loop)，供 LangGraph 同步节点跨线程读取
+_task_rag_queues: dict = {}
+_task_rag_queues_lock = threading.Lock()
 
 # 非 async 上下文（单元测试、直接调用）的兜底存储
 _thread_local = threading.local()
@@ -122,15 +127,18 @@ _thread_local = threading.local()
 
 def _task_store() -> dict:
     """返回当前请求的可变状态字典。协程和 asyncio.to_thread 线程均可读写。"""
+    # 协程侧：直接用 asyncio.current_task()
     try:
         task = asyncio.current_task()
-        if task is not None:
-            if not hasattr(task, '_tools_state'):
-                task._tools_state = {'rag_context': None, 'call_count': 0, 'rag_options': {}}
-            return task._tools_state
     except RuntimeError:
-        # 线程池中没有事件循环，降级到线程本地存储
-        pass
+        task = None
+    # 工具线程侧：asyncio.current_task() 返回 None，从 ContextVar 读父 Task
+    if task is None:
+        task = _CURRENT_TASK.get()
+    if task is not None:
+        if not hasattr(task, '_tools_state'):
+            task._tools_state = {'rag_context': None, 'call_count': 0, 'rag_options': {}}
+        return task._tools_state
     # 兜底：同步测试或非 async 调用场景
     if not hasattr(_thread_local, '_tools_state'):
         _thread_local._tools_state = {'rag_context': None, 'call_count': 0, 'rag_options': {}}
@@ -177,26 +185,63 @@ def reset_tool_call_guards():
 def set_rag_step_queue(queue):
     """设置 RAG 步骤队列，并捕获当前事件循环以便跨线程调度。"""
     _RAG_STEP_QUEUE.set(queue)
-    if queue:
-        try:
-            _RAG_STEP_LOOP.set(asyncio.get_running_loop())
-        except RuntimeError:
-            _RAG_STEP_LOOP.set(asyncio.get_event_loop())
-    else:
-        _RAG_STEP_LOOP.set(None)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    _RAG_STEP_LOOP.set(loop)
+
+    # 把当前 Task 写入 ContextVar，asyncio.to_thread 复制 context 时带给工具线程
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    _CURRENT_TASK.set(task)
+
+    # 同时写入全局字典，供 LangGraph 同步节点（无 ContextVar 复制）跨线程读取
+    task = None
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        pass
+    if task is not None:
+        with _task_rag_queues_lock:
+            if queue is not None and loop is not None:
+                _task_rag_queues[id(task)] = (queue, loop)
+            else:
+                _task_rag_queues.pop(id(task), None)
 
 
 def emit_rag_step(icon: str, label: str, detail: str = ""):
     """向队列发送一个 RAG 检索步骤。支持跨线程安全调用。"""
+    step = {"icon": icon, "label": label, "detail": detail}
+
+    # 优先从 ContextVar 取（asyncio.to_thread 场景）
     queue = _RAG_STEP_QUEUE.get()
     loop = _RAG_STEP_LOOP.get()
-    if queue is not None and loop is not None:
-        step = {"icon": icon, "label": label, "detail": detail}
+    if queue is not None and loop is not None and not loop.is_closed():
         try:
-            if not loop.is_closed():
-                loop.call_soon_threadsafe(queue.put_nowait, step)
+            loop.call_soon_threadsafe(queue.put_nowait, step)
         except Exception:
             pass
+        return
+
+    # 降级：从全局字典按 task id 取（LangGraph 同步节点场景）
+    task = None
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        pass
+    if task is not None:
+        with _task_rag_queues_lock:
+            entry = _task_rag_queues.get(id(task))
+        if entry:
+            q, lp = entry
+            if not lp.is_closed():
+                try:
+                    lp.call_soon_threadsafe(q.put_nowait, step)
+                except Exception:
+                    pass
 
 
 @tool("get_current_weather")
@@ -268,8 +313,8 @@ def search_knowledge_base(query: str) -> str:
     if store['call_count'] >= 1:
         logger.warning(f"🔒 已拦截重复KB调用: search_knowledge_base, 查询='{query[:50]}...'")
         return (
-            "TOOL_CALL_LIMIT_REACHED: search_knowledge_base has already been called once in this turn. "
-            "Use the existing retrieval result and provide the final answer directly."
+            "知识库已在本轮检索过一次，结果已包含在上方工具返回内容中。"
+            "请直接根据已有的检索结果回答用户问题，不要再次调用此工具。"
         )
     store['call_count'] += 1
     logger.info(f"🔧 Agent首次调用工具: search_knowledge_base, 查询='{query[:50]}...'")
