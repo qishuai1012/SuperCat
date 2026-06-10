@@ -15,7 +15,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # 导入 API 路由和数据库初始化工具
-import api as api_module
+from routes.router import router
 from database import init_db
 
 # ====================== 日志系统配置 ======================
@@ -44,7 +44,7 @@ def create_app() -> FastAPI:
         init_db()
 
         # 懒加载 embedding 服务，避免循环导入
-        from embedding import embedding_service
+        from storage.embedding import embedding_service
         # 异步预热 embedding 模型（加载到内存，加速第一次请求）
         await asyncio.to_thread(embedding_service.warmup)
 
@@ -72,7 +72,7 @@ def create_app() -> FastAPI:
 
     # ====================== 注册 API 路由 ======================
     # 把聊天、检索、文件上传等接口注册到 app
-    app.include_router(api_module.router)
+    app.include_router(router)
 
     # ====================== 挂载前端静态页面 ======================
     # 如果存在前端目录，则将根路径映射为网页

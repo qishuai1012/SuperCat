@@ -85,7 +85,7 @@ def should_skip_grading(query: str) -> bool:
     if not query:
         return True
 
-    from complexity_analyzer import get_complexity_analyzer
+    from query_understanding.complexity import get_complexity_analyzer
 
     complexity = get_complexity_analyzer().analyze(query).value
     if complexity == "simple":
@@ -319,7 +319,7 @@ def search_knowledge_base(query: str) -> str:
     store['call_count'] += 1
     logger.info(f"🔧 Agent首次调用工具: search_knowledge_base, 查询='{query[:50]}...'")
 
-    from rag_pipeline import run_rag_graph
+    from rag.pipeline import run_rag_graph
 
     rag_options = get_rag_options(clear=True)
     expansion_hint = rag_options.get("expansion_hint")

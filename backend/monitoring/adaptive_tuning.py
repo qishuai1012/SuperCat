@@ -160,7 +160,7 @@ class AdaptiveTuner:
         # 加锁避免多线程重复导入
         with self._lock:
             if not self._learning_system_loaded and self._learning_system is None:
-                from learning_system import OnlineLearningSystem
+                from monitoring.learning_system import OnlineLearningSystem
                 self._learning_system = OnlineLearningSystem()
                 self._learning_system_loaded = True
         return self._learning_system
@@ -629,13 +629,13 @@ class AdaptiveTuner:
 
     def _adjust_retrieval_top_k(self, adjustment: int):
         """调整检索数量"""
-        from rag_utils import LEAF_RETRIEVE_LEVEL
+        from rag.retrieval import LEAF_RETRIEVE_LEVEL
         # 这里应该调用实际的检索组件
         logger.info(f"调整检索数量: top_k += {adjustment}")
 
     def _adjust_retrieval_threshold(self, adjustment: float):
         """调整检索阈值"""
-        from rag_utils import AUTO_MERGE_THRESHOLD
+        from rag.retrieval import AUTO_MERGE_THRESHOLD
         # 这里应该调用实际的检索组件
         logger.info(f"调整检索阈值: threshold += {adjustment}")
 

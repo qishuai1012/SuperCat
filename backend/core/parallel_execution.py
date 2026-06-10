@@ -12,7 +12,7 @@ from enum import Enum
 import threading
 import os
 
-from multi_agent_orchestrator import AgentTask, AgentResult, AgentType
+from core.multi_agent_orchestrator import AgentTask, AgentResult, AgentType
 
 logger = logging.getLogger(__name__)
 

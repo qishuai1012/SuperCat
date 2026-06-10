@@ -117,8 +117,8 @@ class SimpleQueryStrategy(ExecutionStrategy):
 
         # 注入记忆
         try:
-            from memory_optimizer import retrieve_memories
-            memories = retrieve_memories(context.user_text, {
+            from core.memory_optimizer import retrieve_memories
+            memories = retrieve_memories(context.query_for_retrieval, {
                 "user_id": context.user_id,
                 "session_id": context.session_id
             })

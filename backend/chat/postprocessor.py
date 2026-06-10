@@ -1,6 +1,6 @@
 import logging
 
-from performance_config import get_performance_config
+from monitoring.performance_config import get_performance_config
 from query_understanding.types import QueryComplexity
 
 logger = logging.getLogger(__name__)

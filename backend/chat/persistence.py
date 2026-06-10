@@ -29,7 +29,7 @@ class ConversationPersistence:
         return str(value)
 
     def _persist_memory(self, context, result, payload: dict | None = None) -> None:
-        from memory_optimizer import add_memory, get_memory_optimizer
+        from core.memory_optimizer import add_memory, get_memory_optimizer
 
         tags = ["dialogue", context.session_id, context.complexity]
         strategy = result.metadata.get("strategy")
@@ -59,7 +59,7 @@ class ConversationPersistence:
         get_memory_optimizer().run_memory_maintenance()
 
     def _collect_learning_metrics(self, context, result, payload: dict | None = None) -> None:
-        from learning_system import PerformanceMetrics, get_online_learning_system
+        from monitoring.learning_system import PerformanceMetrics, get_online_learning_system
 
         started_at = context.started_at or time.perf_counter()
         response_time = max(time.perf_counter() - started_at, 0.0)
@@ -119,8 +119,8 @@ class ConversationPersistence:
         get_online_learning_system().collect_performance_metrics(metrics)
 
     def _collect_observability_metrics(self, context, result, payload: dict | None = None) -> None:
-        from performance_config import get_performance_config
-        from performance_monitor import get_performance_monitor
+        from monitoring.performance_config import get_performance_config
+        from monitoring.performance_monitor import get_performance_monitor
 
         if not get_performance_config().enable_performance_monitoring or not context.query_id:
             return
@@ -166,7 +166,7 @@ class ConversationPersistence:
                 logger.warning(f"可观测性指标保存失败: {e}")
 
             try:
-                from adaptive_tuning import get_adaptive_tuner
+                from monitoring.adaptive_tuning import get_adaptive_tuner
                 asyncio.run(get_adaptive_tuner().optimize_if_needed())
             except Exception as e:
                 logger.warning(f"自适应调优执行失败: {e}")

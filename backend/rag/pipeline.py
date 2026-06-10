@@ -11,13 +11,13 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 
 # 配置：性能策略、问题复杂度分析
-from performance_config import get_performance_config
+from monitoring.performance_config import get_performance_config
 from query_understanding.complexity import get_complexity_analyzer
 # RAG 模块：检索、查询扩展
-from rag.expansion import generate_hypothetical_document, step_back_expand
-from rag.retriever import retrieve_documents
+from rag.retrieval import generate_hypothetical_document, step_back_expand
+from rag.retrieval import retrieve_documents
 # 工具函数：RRF融合、结果评估、文档格式化、追踪日志
-from rag_utils import build_retrieval_judgement, _merge_query_results
+from rag.retrieval import build_retrieval_judgement, _merge_query_results
 from rag.trace import _format_docs, build_retrieval_trace, merge_rag_trace
 # 前端/日志输出工具
 from tools import emit_rag_step, should_skip_grading
@@ -719,7 +719,7 @@ def run_rag_graph(question: str, skip_grading: bool = False, expansion_hint: str
 
 #测试 RAG 效果好不好，打分、评估准确率
 def evaluate_rag_retrieval(question: str, relevant_ids: List[str], *, k: int | None = None, skip_grading: bool = False, expansion_hint: str | None = None) -> dict:
-    from learning_system import get_online_learning_system
+    from monitoring.learning_system import get_online_learning_system
 
     rag_result = run_rag_graph(question, skip_grading=skip_grading, expansion_hint=expansion_hint)
     docs = rag_result.get("docs") or []

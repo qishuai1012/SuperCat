@@ -14,7 +14,7 @@ from enum import Enum
 import threading
 from contextlib import asynccontextmanager
 
-from memory_optimizer import MemoryCompressor
+from core.memory_optimizer import MemoryCompressor
 from chat.result_builder import ResultBuilder
 from schemas import CompactTrace, CompressionMetadata, ContextBundle, KnowledgePoint, MessageDigest, PlanningSummary, RetrievedChunk, SubtaskResultSummary, VerificationSummary
 
@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from dotenv import load_dotenv
 import os
 
-from task_decomposer import TaskType, get_task_decomposer
+from core.task_decomposer import TaskType, get_task_decomposer
 
 logger = logging.getLogger(__name__)
 

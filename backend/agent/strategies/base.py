@@ -15,6 +15,11 @@ class QueryContext:
     route_decision: Any = None
     execution_class: str | None = None
     expansion_hint: str | None = None
+    retrieval_text: str | None = None  # 改写后用于检索，None 时退回 user_text
+
+    @property
+    def query_for_retrieval(self) -> str:
+        return self.retrieval_text or self.user_text
     started_at: float | None = None
     query_id: str | None = None
 

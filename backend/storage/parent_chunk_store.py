@@ -9,7 +9,7 @@
 from datetime import datetime
 from typing import List
 
-from cache import cache
+from storage.cache import cache
 from database import SessionLocal
 from models import ParentChunk
 

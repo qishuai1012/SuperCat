@@ -5,10 +5,10 @@ from pathlib import Path
 from fastapi import HTTPException, UploadFile
 
 from document_loader import DocumentLoader
-from file_utils import calculate_file_md5
-from milvus_client import MilvusManager
-from milvus_writer import MilvusWriter
-from parent_chunk_store import ParentChunkStore
+from services.file_utils import calculate_file_md5
+from storage.milvus_client import MilvusManager
+from storage.milvus_writer import MilvusWriter
+from storage.parent_chunk_store import ParentChunkStore
 from schemas import DocumentUploadResponse
 
 

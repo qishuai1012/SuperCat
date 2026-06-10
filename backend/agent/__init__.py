@@ -49,7 +49,7 @@ def _init_system():
     # 如果启用多智能体，添加复杂策略
     if _config.enable_multi_agent:
         try:
-            from multi_agent_orchestrator import get_multi_agent_orchestrator
+            from core.multi_agent_orchestrator import get_multi_agent_orchestrator
             orchestrator = get_multi_agent_orchestrator()
             strategies.append(ComplexQueryStrategy(orchestrator, _factory, _storage))
         except Exception as e:
@@ -57,8 +57,8 @@ def _init_system():
 
     # 创建处理器
     try:
-        from intelligent_router import get_intelligent_router
-        from reflection_agent import get_reflection_agent
+        from query_understanding.router import get_intelligent_router
+        from core.reflection_agent import get_reflection_agent
         router = get_intelligent_router()
         reflection = get_reflection_agent()
     except Exception as e:

@@ -1,7 +1,7 @@
 import logging
 
-from parent_chunk_store import ParentChunkStore
-from milvus_client import MilvusManager
+from storage.parent_chunk_store import ParentChunkStore
+from storage.milvus_client import MilvusManager
 from schemas import DocumentDeleteResponse, DocumentInfo, DocumentListResponse
 
 # 生产级必备：日志记录器，用于排查线上问题

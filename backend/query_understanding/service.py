@@ -1,10 +1,10 @@
 # 导入依赖：动态检索策略、性能配置、问题复杂度分析、智能路由、类型定义、智能缓存
-from dynamic_retrieval_strategy import get_dynamic_retrieval_strategy
-from performance_config import get_performance_config
+from query_understanding.retrieval_policy import get_dynamic_retrieval_strategy
+from monitoring.performance_config import get_performance_config
 from query_understanding.complexity import get_complexity_analyzer
 from query_understanding.router import get_intelligent_router
 from query_understanding.types import QueryComplexity, QueryUnderstandingResult, RouteDecision, RouteStrategy
-from smart_cache import get_smart_cache
+from storage.cache import get_smart_cache
 
 """
 服务功能：查询理解服务（RAG 系统的“大脑”）

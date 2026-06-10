@@ -8,15 +8,15 @@ from auth import require_admin
 # 文档加载器：读取PDF、Word、TXT等文件内容
 from document_loader import DocumentLoader
 # 向量嵌入服务：将文本转为向量
-from embedding import embedding_service
+from storage.embedding import embedding_service
 # Milvus向量数据库客户端：负责查询、删除、管理数据
-from milvus_client import MilvusManager
+from storage.milvus_client import MilvusManager
 # Milvus写入器：负责将分块文本+向量入库
-from milvus_writer import MilvusWriter
+from storage.milvus_writer import MilvusWriter
 # 用户模型
 from models import User
 # 父文本块存储：用于RAG长上下文召回
-from parent_chunk_store import ParentChunkStore
+from storage.parent_chunk_store import ParentChunkStore
 # 文档服务：文档列表查询、删除
 from services.document_catalog import DocumentCatalogService
 # 文档入库服务：上传、解析、分块、向量化、入库全流程

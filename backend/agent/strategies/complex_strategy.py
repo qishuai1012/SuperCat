@@ -1,6 +1,6 @@
 """复杂查询策略"""
 import logging
-from multi_agent_orchestrator import RequestLevelOrchestrationError
+from core.multi_agent_orchestrator import RequestLevelOrchestrationError
 from tools import reset_tool_call_guards
 from .base import ExecutionStrategy, QueryContext, ExecutionResult
 
@@ -26,7 +26,7 @@ class ComplexQueryStrategy(ExecutionStrategy):
         reset_tool_call_guards()
         try:
             result = await self.orchestrator.coordinate_task(
-                context.user_text,
+                context.query_for_retrieval,
                 {
                     "user_id": context.user_id,
                     "session_id": context.session_id,

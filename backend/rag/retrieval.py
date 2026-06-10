@@ -8,13 +8,13 @@ import requests
 from dotenv import load_dotenv
 
 # 引入项目内部核心模块
-from milvus_client import MilvusManager
-from embedding import embedding_service as _embedding_service
-from parent_chunk_store import ParentChunkStore
-from performance_config import get_performance_config
+from storage.milvus_client import MilvusManager
+from storage.embedding import embedding_service as _embedding_service
+from storage.parent_chunk_store import ParentChunkStore
+from monitoring.performance_config import get_performance_config
 from query_understanding.service import get_query_understanding_service
 from query_understanding.types import QueryComplexity, RetrievalStrategy
-from smart_cache import get_smart_cache
+from storage.cache import get_smart_cache
 
 from langchain.chat_models import init_chat_model
 
@@ -456,7 +456,7 @@ def rewrite_with_context(user_text: str, history: list) -> str:
     if not history:
         return user_text
     model = _get_stepback_model()
-    recent = history[-6:]  # 最近3轮
+    recent = history[-6:]
     history_str = "\n".join(
         f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')}"
         for m in recent

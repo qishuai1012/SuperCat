@@ -3,8 +3,8 @@
 功能：将分块后的文档 → 生成向量 → 批量写入向量数据库
 支持混合检索（密集向量语义搜索 + 稀疏向量关键词搜索）
 """
-from embedding import EmbeddingService, embedding_service as _default_embedding_service
-from milvus_client import MilvusManager
+from storage.embedding import EmbeddingService, embedding_service as _default_embedding_service
+from storage.milvus_client import MilvusManager
 
 
 class MilvusWriter:

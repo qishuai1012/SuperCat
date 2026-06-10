@@ -1,25 +1,67 @@
-"""
-智能缓存层
-支持查询相似度匹配、TTL过期、LRU淘汰
-"""
-
 import hashlib
 import json
+import logging
+import os
 import re
 import time
 import unicodedata
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Optional, Any, Dict
-from cache import cache
-import logging
+from typing import Any, Dict, Optional
+
+import redis
 
 logger = logging.getLogger(__name__)
 
 
-class SmartCache:
-    """智能缓存管理器"""
+class RedisCache:
+    def __init__(self):
+        self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.key_prefix = os.getenv("REDIS_KEY_PREFIX", "supermew")
+        self.default_ttl = int(os.getenv("REDIS_CACHE_TTL_SECONDS", "300"))
+        self._client = None
 
+    def _get_client(self):
+        if self._client is None:
+            self._client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+        return self._client
+
+    def _key(self, key: str) -> str:
+        return f"{self.key_prefix}:{key}"
+
+    def get_json(self, key: str) -> Optional[Any]:
+        try:
+            value = self._get_client().get(self._key(key))
+            return json.loads(value) if value else None
+        except Exception as e:
+            logger.debug(f"缓存读取失败 key={key}: {e}")
+            return None
+
+    def set_json(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        try:
+            self._get_client().setex(self._key(key), ttl or self.default_ttl, json.dumps(value, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"缓存写入失败 key={key}: {e}")
+
+    def delete(self, key: str) -> None:
+        try:
+            self._get_client().delete(self._key(key))
+        except Exception as e:
+            logger.warning(f"缓存删除失败 key={key}: {e}")
+
+    def delete_pattern(self, pattern: str) -> None:
+        try:
+            keys = self._get_client().keys(self._key(pattern))
+            if keys:
+                self._get_client().delete(*keys)
+        except Exception as e:
+            logger.warning(f"缓存批量删除失败 pattern={pattern}: {e}")
+
+
+cache = RedisCache()
+
+
+class SmartCache:
     def __init__(self, prefix: str = "smart_cache", cache_version: str = "v2"):
         self.prefix = prefix
         self.cache_version = cache_version
@@ -32,16 +74,15 @@ class SmartCache:
         if is_dataclass(value):
             return self._serialize_for_json(asdict(value))
         if isinstance(value, dict):
-            return {str(key): self._serialize_for_json(item) for key, item in value.items()}
+            return {str(k): self._serialize_for_json(v) for k, v in value.items()}
         if isinstance(value, (list, tuple, set)):
-            return [self._serialize_for_json(item) for item in value]
+            return [self._serialize_for_json(i) for i in value]
         return str(value)
 
     def _normalize_query_text(self, query: str) -> str:
         text = unicodedata.normalize("NFKC", str(query or ""))
         text = re.sub(r"^\s*\[ROUTE:[^\]]+\]\s*", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text.casefold()
+        return re.sub(r"\s+", " ", text).strip().casefold()
 
     def _serialize_payload(self, payload: Dict[str, Any], semantic: bool = False) -> str:
         data = dict(self._serialize_for_json(payload) if payload else {})
@@ -52,20 +93,15 @@ class SmartCache:
         return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
     def _make_key(self, query: str, cache_type: str) -> str:
-        """生成缓存键"""
         query_hash = hashlib.md5(query.encode('utf-8')).hexdigest()[:16]
         return f"{self.prefix}:{self.cache_version}:{cache_type}:{query_hash}"
 
     def get_route_decision(self, query: str) -> Optional[Any]:
-        """获取路由决策缓存"""
-        key = self._make_key(query, "route")
-        return cache.get_json(key)
+        return cache.get_json(self._make_key(query, "route"))
 
     def set_route_decision(self, query: str, decision: Any, ttl: int = 3600):
-        """缓存路由决策"""
         key = self._make_key(query, "route")
         try:
-            # 将路由决策对象转为可序列化的字典
             if hasattr(decision, '__dict__'):
                 data = {
                     'strategy': decision.strategy.value if hasattr(decision.strategy, 'value') else str(decision.strategy),
@@ -76,71 +112,50 @@ class SmartCache:
                     'parallel_paths': getattr(decision, 'parallel_paths', 1),
                     'needs_decomposition': getattr(decision, 'needs_decomposition', False),
                     'retrieval_params': self._serialize_for_json(getattr(decision, 'retrieval_params', {}) or {}),
-                    'cached_at': time.time()
+                    'cached_at': time.time(),
                 }
             else:
                 data = {'raw': str(decision), 'cached_at': time.time()}
-
             cache.set_json(key, data, ttl=ttl)
-            logger.debug(f"路由决策已缓存: {query[:30]}")
         except Exception as e:
             logger.warning(f"缓存路由决策失败: {e}")
 
     def get_retrieval_result(self, query: str) -> Optional[Dict]:
-        """获取检索结果缓存"""
-        key = self._make_key(query, "retrieval")
-        return cache.get_json(key)
+        return cache.get_json(self._make_key(query, "retrieval"))
 
     def get_retrieval_result_by_key(self, key_payload: Dict[str, Any]) -> Optional[Dict]:
-        """按结构化键获取检索结果缓存"""
-        key = self._make_key(self._serialize_payload(key_payload, semantic=False), "retrieval")
-        return cache.get_json(key)
+        return cache.get_json(self._make_key(self._serialize_payload(key_payload, semantic=False), "retrieval"))
 
     def get_semantic_retrieval_result_by_key(self, key_payload: Dict[str, Any]) -> Optional[Dict]:
-        """按语义键获取检索结果缓存"""
-        key = self._make_key(self._serialize_payload(key_payload, semantic=True), "retrieval_semantic")
-        return cache.get_json(key)
+        return cache.get_json(self._make_key(self._serialize_payload(key_payload, semantic=True), "retrieval_semantic"))
 
     def set_retrieval_result(self, query: str, result: Dict, ttl: int = 1800):
-        """缓存检索结果"""
-        key = self._make_key(query, "retrieval")
         try:
-            cache.set_json(key, self._serialize_for_json(result), ttl=ttl)
-            logger.debug(f"检索结果已缓存: {query[:30]}")
+            cache.set_json(self._make_key(query, "retrieval"), self._serialize_for_json(result), ttl=ttl)
         except Exception as e:
             logger.warning(f"缓存检索结果失败: {e}")
 
     def set_retrieval_result_by_key(self, key_payload: Dict[str, Any], result: Dict, ttl: int = 1800):
-        """按结构化键缓存检索结果"""
-        key = self._make_key(self._serialize_payload(key_payload, semantic=False), "retrieval")
         try:
-            cache.set_json(key, self._serialize_for_json(result), ttl=ttl)
-            logger.debug("结构化检索结果已缓存")
+            cache.set_json(self._make_key(self._serialize_payload(key_payload, semantic=False), "retrieval"), self._serialize_for_json(result), ttl=ttl)
         except Exception as e:
             logger.warning(f"缓存结构化检索结果失败: {e}")
 
     def set_semantic_retrieval_result_by_key(self, key_payload: Dict[str, Any], result: Dict, ttl: int = 1800):
-        """按语义键缓存检索结果"""
-        key = self._make_key(self._serialize_payload(key_payload, semantic=True), "retrieval_semantic")
         try:
-            cache.set_json(key, self._serialize_for_json(result), ttl=ttl)
-            logger.debug("语义检索结果已缓存")
+            cache.set_json(self._make_key(self._serialize_payload(key_payload, semantic=True), "retrieval_semantic"), self._serialize_for_json(result), ttl=ttl)
         except Exception as e:
             logger.warning(f"缓存语义检索结果失败: {e}")
 
     def invalidate(self, query: str):
-        """清除特定查询的所有缓存"""
         for cache_type in ["route", "retrieval", "retrieval_semantic"]:
-            key = self._make_key(query, cache_type)
-            cache.delete(key)
+            cache.delete(self._make_key(query, cache_type))
 
 
-# 全局实例
 _smart_cache = None
 
 
 def get_smart_cache() -> SmartCache:
-    """获取全局智能缓存"""
     global _smart_cache
     if _smart_cache is None:
         _smart_cache = SmartCache()

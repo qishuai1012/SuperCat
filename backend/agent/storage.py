@@ -4,7 +4,7 @@ from typing import List, Dict
 from datetime import datetime
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from cache import cache
+from storage.cache import cache
 from database import SessionLocal
 from models import User, ChatSession, ChatMessage
 
